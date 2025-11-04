@@ -1106,6 +1106,21 @@ class VideoDownloaderApp(ctk.CTk):
                             'key': 'FFmpegVideoConvertor',
                             'preferedformat': video_format,  # Note: yt-dlp uses 'prefered' (one r)
                         }]
+
+                    # For MP4 format, ensure H.264+AAC codecs for Premiere Pro compatibility
+                    # This prevents issues with VP9/Opus codecs that Premiere Pro doesn't support
+                    if video_format == 'mp4':
+                        if 'postprocessors' not in ydl_opts:
+                            ydl_opts['postprocessors'] = []
+                        ydl_opts['postprocessors'].append({
+                            'key': 'FFmpegVideoConvertor',
+                            'preferedformat': 'mp4',
+                        })
+                        # Force re-encode to H.264 (libx264) video + AAC audio for maximum compatibility
+                        # preset=fast for reasonable encoding speed, crf=23 for good quality
+                        ydl_opts['postprocessor_args'] = {
+                            'videoconvertor': ['-c:v', 'libx264', '-c:a', 'aac', '-preset', 'fast', '-crf', '23']
+                        }
                 else:
                     # Without ffmpeg, download pre-merged formats only
                     if quality == "Best":
@@ -1245,6 +1260,21 @@ class VideoDownloaderApp(ctk.CTk):
                             'key': 'FFmpegVideoConvertor',
                             'preferedformat': video_format,
                         }]
+
+                    # For MP4 format, ensure H.264+AAC codecs for Premiere Pro compatibility
+                    # This prevents issues with VP9/Opus codecs that Premiere Pro doesn't support
+                    if video_format == 'mp4':
+                        if 'postprocessors' not in ydl_opts:
+                            ydl_opts['postprocessors'] = []
+                        ydl_opts['postprocessors'].append({
+                            'key': 'FFmpegVideoConvertor',
+                            'preferedformat': 'mp4',
+                        })
+                        # Force re-encode to H.264 (libx264) video + AAC audio for maximum compatibility
+                        # preset=fast for reasonable encoding speed, crf=23 for good quality
+                        ydl_opts['postprocessor_args'] = {
+                            'videoconvertor': ['-c:v', 'libx264', '-c:a', 'aac', '-preset', 'fast', '-crf', '23']
+                        }
                 else:
                     if quality == "Best":
                         ydl_opts['format'] = 'best'
