@@ -17,7 +17,7 @@ import tempfile
 
 class VideoDownloaderApp(ctk.CTk):
     # Version of the app - update this with each release
-    CURRENT_VERSION = "3.1.3"
+    CURRENT_VERSION = "3.1.4"
     # GitHub repository for updates
     GITHUB_REPO = "LaceEditing/laces-total-media-downloader"
 
@@ -156,6 +156,12 @@ class VideoDownloaderApp(ctk.CTk):
             hover_color=self.colors['purple']
         )
 
+        # Update check for updates button
+        self.check_updates_btn.configure(
+            fg_color=self.colors['button'],
+            hover_color=self.colors['purple']
+        )
+
         # Update container frames
         for frame in [self.type_quality_frame, self.type_frame, self.quality_frame,
                       self.format_frame, self.output_row]:
@@ -262,6 +268,62 @@ class VideoDownloaderApp(ctk.CTk):
                                                                           data.get('body', '')))
             except:
                 pass  # Silently fail if update check fails
+
+        # Run update check in background thread
+        thread = threading.Thread(target=check, daemon=True)
+        thread.start()
+
+    def manual_check_for_updates(self):
+        """Manually check for updates when user clicks the button"""
+        def check():
+            try:
+                # Show checking message
+                self.after(0, lambda: messagebox.showinfo(
+                    "Checking for Updates",
+                    "Checking for updates, please wait..."
+                ))
+
+                # Check GitHub API for latest release
+                api_url = f"https://api.github.com/repos/{self.GITHUB_REPO}/releases/latest"
+                response = requests.get(api_url, timeout=5)
+
+                if response.status_code == 200:
+                    data = response.json()
+                    latest_version = data['tag_name'].lstrip('v')
+
+                    # Compare versions
+                    if version.parse(latest_version) > version.parse(self.CURRENT_VERSION):
+                        # Found newer version
+                        download_url = None
+                        for asset in data.get('assets', []):
+                            if asset['name'].endswith('.exe'):
+                                download_url = asset['browser_download_url']
+                                break
+
+                        if download_url:
+                            self.after(0, lambda: self.show_update_dialog(latest_version, download_url,
+                                                                          data.get('body', '')))
+                        else:
+                            self.after(0, lambda: messagebox.showinfo(
+                                "No Update Available",
+                                f"No downloadable update found for version {latest_version}."
+                            ))
+                    else:
+                        # Already on latest version
+                        self.after(0, lambda: messagebox.showinfo(
+                            "No Updates Available",
+                            f"You're already on the latest version ({self.CURRENT_VERSION})!"
+                        ))
+                else:
+                    self.after(0, lambda: messagebox.showerror(
+                        "Update Check Failed",
+                        "Failed to check for updates. Please try again later."
+                    ))
+            except Exception as e:
+                self.after(0, lambda: messagebox.showerror(
+                    "Update Check Failed",
+                    f"Failed to check for updates:\n{str(e)}"
+                ))
 
         # Run update check in background thread
         thread = threading.Thread(target=check, daemon=True)
@@ -661,6 +723,20 @@ class VideoDownloaderApp(ctk.CTk):
             text_color=self.colors['purple']
         )
         self.title_label.pack(side="left", expand=True)
+
+        # Check for Updates button
+        self.check_updates_btn = ctk.CTkButton(
+            self.header_frame,
+            text="🔄",
+            command=self.manual_check_for_updates,
+            width=50,
+            height=50,
+            font=ctk.CTkFont(size=20),
+            fg_color=self.colors['button'],
+            hover_color=self.colors['purple'],
+            corner_radius=25
+        )
+        self.check_updates_btn.pack(side="right", padx=(0, 10))
 
         # Dark mode toggle button
         self.dark_mode_btn = ctk.CTkButton(
