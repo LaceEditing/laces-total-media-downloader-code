@@ -1,4 +1,4 @@
-import os
+﻿import os
 import sys
 import shutil
 
@@ -758,11 +758,11 @@ class VideoDownloaderApp(ctk.CTk):
         # Check for Updates button
         self.check_updates_btn = ctk.CTkButton(
             self.header_frame,
-            text="🔄",
+            text="Update",
             command=self.manual_check_for_updates,
-            width=50,
-            height=50,
-            font=ctk.CTkFont(size=20),
+            width=70,
+            height=35,
+            font=ctk.CTkFont(family="Bartino", size=13) if self.has_bartino else ctk.CTkFont(size=13),
             fg_color=self.colors['button'],
             hover_color=self.colors['purple'],
             corner_radius=25
