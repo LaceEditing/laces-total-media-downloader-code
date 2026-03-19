@@ -1,19 +1,47 @@
 ﻿import os
 import sys
 import shutil
+import subprocess
 
-# Ensure ~/.fonts exists before CustomTkinter is imported so its shapes font
-# can be installed on Linux (prevents "Y" rendering instead of dropdown arrows)
+# On Linux, pre-install custom fonts AND ensure ~/.fonts exists before
+# CustomTkinter is imported. CTk will also copy its shapes font + Roboto
+# into ~/.fonts during import.  After that we run fc-cache so fontconfig
+# (and therefore Tk) can actually find every font before the Tk root window
+# is created.  Without this, the shapes font silently fails and widgets
+# render "Y" instead of dropdown arrows, wrong radio-button glyphs, and
+# rough/jagged rounded corners.
 if sys.platform.startswith('linux'):
-    os.makedirs(os.path.expanduser('~/.fonts'), exist_ok=True)
+    _fonts_dir = os.path.expanduser('~/.fonts')
+    os.makedirs(_fonts_dir, exist_ok=True)
+    # Pre-copy the app's own fonts so they are indexed together with CTk's
+    _base = os.path.dirname(os.path.abspath(__file__))
+    for _fname in ('BubblegumSans-Regular.ttf', 'bartino.ttf'):
+        _src = os.path.join(_base, 'assets', 'fonts', _fname)
+        _dst = os.path.join(_fonts_dir, _fname)
+        if os.path.exists(_src) and not os.path.exists(_dst):
+            try:
+                shutil.copy(_src, _dst)
+            except OSError:
+                pass
 
 import customtkinter as ctk
+
+# Rebuild fontconfig cache AFTER CTk copied its fonts to ~/.fonts but
+# BEFORE any Tk root window is created (that happens in ctk.CTk.__init__).
+if sys.platform.startswith('linux'):
+    try:
+        subprocess.run(
+            ['fc-cache', '-f', os.path.expanduser('~/.fonts')],
+            stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL, timeout=30,
+        )
+    except Exception:
+        pass
+
 from tkinter import filedialog, messagebox
 import yt_dlp
 import threading
 from pathlib import Path
 import re
-import subprocess
 import json
 from pygame import mixer
 import requests
