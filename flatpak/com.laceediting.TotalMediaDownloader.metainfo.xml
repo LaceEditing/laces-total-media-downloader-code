@@ -1,0 +1,43 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<component type="desktop-application">
+  <id>com.laceediting.TotalMediaDownloader</id>
+  <metadata_license>CC0-1.0</metadata_license>
+  <project_license>MIT</project_license>
+  <name>Lace's Total Media Downloader</name>
+  <summary>Download videos and audio from the internet</summary>
+
+  <description>
+    <p>
+      A friendly media downloader with a cute UI that lets you download videos and
+      audio from hundreds of websites. Supports MP4, MP3, and other formats with
+      automatic codec handling for maximum compatibility.
+    </p>
+    <p>Features:</p>
+    <ul>
+      <li>Download video (MP4) or audio (MP3) from hundreds of sites</li>
+      <li>Playlist support with single or full download options</li>
+      <li>Light and dark mode themes</li>
+      <li>Progress tracking and notification sounds</li>
+      <li>Automatic ffmpeg detection</li>
+    </ul>
+  </description>
+
+  <launchable type="desktop-id">com.laceediting.TotalMediaDownloader.desktop</launchable>
+
+  <url type="homepage">https://github.com/LaceEditing/laces-total-media-downloader</url>
+  <url type="bugtracker">https://github.com/LaceEditing/laces-total-media-downloader/issues</url>
+
+  <provides>
+    <binary>laces-total-media-downloader</binary>
+  </provides>
+
+  <content_rating type="oars-1.1" />
+
+  <releases>
+    <release version="3.5.0" date="2026-03-19">
+      <description>
+        <p>Major update with improved MP4 compatibility, thread safety fixes, and Flatpak support.</p>
+      </description>
+    </release>
+  </releases>
+</component>

@@ -17,7 +17,7 @@ import tempfile
 
 class VideoDownloaderApp(ctk.CTk):
     # Version of the app - update this with each release
-    CURRENT_VERSION = "3.1.4"
+    CURRENT_VERSION = "3.5.0"
     # GitHub repository for updates
     GITHUB_REPO = "LaceEditing/laces-total-media-downloader"
 
@@ -35,25 +35,11 @@ class VideoDownloaderApp(ctk.CTk):
         # Initialize pygame mixer for sounds
         try:
             mixer.init()
-        except:
+        except Exception:
             pass
 
-        # Dark mode state - default to dark mode
-        self.is_dark_mode = True
-
-        # Color schemes - Light mode
-        self.light_colors = {
-            'bg': "#E8E4F3",
-            'purple': "#9B6BD8",
-            'dark_purple': "#8055C4",
-            'pink': "#D891E8",
-            'button': "#B88ED8",
-            'frame_bg': "white",
-            'text': "#333333"
-        }
-
-        # Color schemes - Dark mode
-        self.dark_colors = {
+        # Color scheme (dark mode)
+        self.colors = {
             'bg': "#1a1625",
             'purple': "#B88ED8",
             'dark_purple': "#9B6BD8",
@@ -62,9 +48,6 @@ class VideoDownloaderApp(ctk.CTk):
             'frame_bg': "#2d2438",
             'text': "#E8E4F3"
         }
-
-        # Set initial colors to dark mode
-        self.colors = self.dark_colors
 
         ctk.set_appearance_mode("dark")
         ctk.set_default_color_theme("blue")
@@ -82,6 +65,7 @@ class VideoDownloaderApp(ctk.CTk):
         self.ffmpeg_available = self.check_ffmpeg()
         self.downloaded_file_path = None
         self.recent_folders = self.load_recent_folders()
+        self._recent_display_to_path = {}  # Populated by update_recent_dropdown
         self.ytdlp_exe_path = None  # Will be set if yt-dlp.exe is downloaded
 
         # Load custom fonts
@@ -99,73 +83,15 @@ class VideoDownloaderApp(ctk.CTk):
         # Check for updates on startup
         self.after(1000, self.check_for_updates)
 
-    def toggle_dark_mode(self):
-        """Toggle between light and dark mode"""
-        self.is_dark_mode = not self.is_dark_mode
-        self.colors = self.dark_colors if self.is_dark_mode else self.light_colors
+    def destroy(self):
+        """Clean up resources before closing."""
+        try:
+            mixer.quit()
+        except Exception:
+            pass
+        super().destroy()
 
-        # Update appearance mode
-        ctk.set_appearance_mode("dark" if self.is_dark_mode else "light")
 
-        # Update all UI elements
-        self.configure(fg_color=self.colors['bg'])
-        self.main_frame.configure(fg_color=self.colors['bg'])
-        self.header_frame.configure(fg_color=self.colors['bg'])
-
-        # Update title
-        self.title_label.configure(text_color=self.colors['purple'])
-
-        # Update all frames
-        for frame in [self.url_frame, self.options_frame, self.progress_frame, self.output_frame]:
-            frame.configure(fg_color=self.colors['frame_bg'])
-
-        # Update labels
-        for label in [self.url_label, self.options_label, self.progress_label, self.output_label]:
-            label.configure(text_color=self.colors['text'])
-
-        # Update small labels
-        for label in [self.type_label, self.quality_label, self.format_label]:
-            label.configure(text_color=self.colors['text'])
-
-        # Update entry fields
-        self.url_entry.configure(border_color=self.colors['purple'], fg_color=self.colors['frame_bg'])
-        self.output_entry.configure(border_color=self.colors['purple'], fg_color=self.colors['frame_bg'])
-
-        # Update radio buttons
-        self.video_radio.configure(fg_color=self.colors['purple'], hover_color=self.colors['dark_purple'])
-        self.audio_radio.configure(fg_color=self.colors['purple'], hover_color=self.colors['dark_purple'])
-
-        # Update option menus
-        for menu in [self.video_quality_menu, self.audio_quality_menu,
-                     self.video_format_menu, self.audio_format_menu, self.recent_dropdown]:
-            menu.configure(fg_color=self.colors['button'],
-                           button_color=self.colors['purple'],
-                           button_hover_color=self.colors['dark_purple'])
-
-        # Update buttons
-        self.download_btn.configure(fg_color=self.colors['button'], hover_color=self.colors['purple'])
-        self.browse_btn.configure(fg_color=self.colors['pink'], hover_color=self.colors['purple'])
-
-        # Update progress bar
-        self.progress_bar.configure(progress_color=self.colors['purple'])
-
-        # Update dark mode button
-        self.dark_mode_btn.configure(
-            text="☀️" if self.is_dark_mode else "🌙",
-            fg_color=self.colors['button'],
-            hover_color=self.colors['purple']
-        )
-
-        # Update check for updates button
-        self.check_updates_btn.configure(
-            fg_color=self.colors['button'],
-            hover_color=self.colors['purple']
-        )
-
-        # Update container frames
-        for frame in [self.type_quality_frame, self.type_frame, self.quality_frame,
-                      self.format_frame, self.output_row]:
-            frame.configure(fg_color=self.colors['frame_bg'])
 
     def set_icon(self):
         """Set window icon from assets/icons folder"""
@@ -202,7 +128,7 @@ class VideoDownloaderApp(ctk.CTk):
                         # For ICO icons (Windows)
                         self.iconbitmap(icon_path)
                     break
-        except:
+        except Exception:
             # Fallback: try iconbitmap method
             try:
                 if getattr(sys, 'frozen', False):
@@ -213,7 +139,7 @@ class VideoDownloaderApp(ctk.CTk):
                 icon_path = os.path.join(base_path, 'assets', 'icons', 'icon.png')
                 if os.path.exists(icon_path):
                     self.iconphoto(True, icon_path)
-            except:
+            except Exception:
                 pass
 
     def load_custom_fonts(self):
@@ -231,7 +157,7 @@ class VideoDownloaderApp(ctk.CTk):
             # Check if fonts exist
             self.has_bubblegum = os.path.exists(self.bubblegum_font_path)
             self.has_bartino = os.path.exists(self.bartino_font_path)
-        except:
+        except Exception:
             self.has_bubblegum = False
             self.has_bartino = False
 
@@ -266,7 +192,7 @@ class VideoDownloaderApp(ctk.CTk):
                         if download_url:
                             self.after(0, lambda: self.show_update_dialog(latest_version, download_url,
                                                                           data.get('body', '')))
-            except:
+            except Exception:
                 pass  # Silently fail if update check fails
 
         # Run update check in background thread
@@ -275,13 +201,12 @@ class VideoDownloaderApp(ctk.CTk):
 
     def manual_check_for_updates(self):
         """Manually check for updates when user clicks the button"""
+        default_status = "Quivering in anticipation...\nSlap that URL up above and smash that download button!"
+
         def check():
             try:
-                # Show checking message
-                self.after(0, lambda: messagebox.showinfo(
-                    "Checking for Updates",
-                    "Checking for updates, please wait..."
-                ))
+                # Update the status bar instead of showing a blocking dialog
+                self.after(0, lambda: self.update_status("Checking for updates...", append=False))
 
                 # Check GitHub API for latest release
                 api_url = f"https://api.github.com/repos/{self.GITHUB_REPO}/releases/latest"
@@ -314,16 +239,24 @@ class VideoDownloaderApp(ctk.CTk):
                             "No Updates Available",
                             f"You're already on the latest version ({self.CURRENT_VERSION})!"
                         ))
+                elif response.status_code == 404:
+                    self.after(0, lambda: messagebox.showinfo(
+                        "No Releases Found",
+                        "No releases are published yet for this app.\n\n"
+                        f"You're running version {self.CURRENT_VERSION}."
+                    ))
                 else:
                     self.after(0, lambda: messagebox.showerror(
                         "Update Check Failed",
-                        "Failed to check for updates. Please try again later."
+                        f"Failed to check for updates (HTTP {response.status_code}).\nPlease try again later."
                     ))
             except Exception as e:
                 self.after(0, lambda: messagebox.showerror(
                     "Update Check Failed",
                     f"Failed to check for updates:\n{str(e)}"
                 ))
+            finally:
+                self.after(0, lambda: self.update_status(default_status, append=False))
 
         # Run update check in background thread
         thread = threading.Thread(target=check, daemon=True)
@@ -331,46 +264,78 @@ class VideoDownloaderApp(ctk.CTk):
 
     def update_ytdlp(self):
         """Automatically update yt-dlp to the latest version to prevent HTTP 403 errors"""
+        # Skip in sandboxed Linux environments where we can't write or pip install
+        if sys.platform.startswith('linux'):
+            if os.path.exists('/.flatpak-info') or os.environ.get('SNAP'):
+                return
+
         def update():
             try:
                 # Check if we're running as a frozen executable (PyInstaller)
                 is_frozen = getattr(sys, 'frozen', False)
 
                 if is_frozen:
-                    # For frozen executable, download yt-dlp.exe and keep it updated
-                    # Determine the directory where the exe is located
+                    # For frozen executable, download yt-dlp binary and keep it updated
                     if hasattr(sys, '_MEIPASS'):
-                        # Running from temp folder
                         app_dir = os.path.dirname(sys.executable)
                     else:
                         app_dir = os.path.dirname(os.path.abspath(__file__))
 
-                    ytdlp_exe_path = os.path.join(app_dir, 'yt-dlp.exe')
+                    # Choose the right binary for the platform
+                    if sys.platform == 'win32':
+                        ytdlp_filename = 'yt-dlp.exe'
+                        ytdlp_url = 'https://github.com/yt-dlp/yt-dlp/releases/latest/download/yt-dlp.exe'
+                        min_size = 1_000_000  # Expect at least ~1MB
+                    else:
+                        ytdlp_filename = 'yt-dlp'
+                        ytdlp_url = 'https://github.com/yt-dlp/yt-dlp/releases/latest/download/yt-dlp'
+                        min_size = 1_000_000
 
-                    # Download latest yt-dlp.exe
-                    ytdlp_url = 'https://github.com/yt-dlp/yt-dlp/releases/latest/download/yt-dlp.exe'
+                    ytdlp_exe_path = os.path.join(app_dir, ytdlp_filename)
 
-                    response = requests.get(ytdlp_url, timeout=30)
-                    if response.status_code == 200:
-                        with open(ytdlp_exe_path, 'wb') as f:
-                            f.write(response.content)
+                    # Download to a temp file first, then rename (atomic-ish)
+                    temp_path = ytdlp_exe_path + '.tmp'
+                    try:
+                        response = requests.get(ytdlp_url, timeout=60)
+                        if response.status_code == 200:
+                            with open(temp_path, 'wb') as f:
+                                f.write(response.content)
 
-                        # Store the path for later use
-                        self.ytdlp_exe_path = ytdlp_exe_path
-                        # Thread-safe status update
-                        self.after(0, lambda: self.update_status("yt-dlp updated successfully!"))
+                            # Verify the download isn't truncated/corrupt
+                            if os.path.getsize(temp_path) < min_size:
+                                os.remove(temp_path)
+                                raise Exception("Downloaded yt-dlp binary is too small, possibly corrupt")
+
+                            # Replace the real file
+                            shutil.move(temp_path, ytdlp_exe_path)
+
+                            # Make executable on Linux/Mac
+                            if sys.platform != 'win32':
+                                os.chmod(ytdlp_exe_path, 0o755)
+
+                            self.ytdlp_exe_path = ytdlp_exe_path
+                            self.after(0, lambda: self.update_status("yt-dlp updated successfully!"))
+                        else:
+                            raise Exception(f"Download failed with status {response.status_code}")
+                    finally:
+                        # Clean up temp file if it still exists
+                        if os.path.exists(temp_path):
+                            try:
+                                os.remove(temp_path)
+                            except Exception:
+                                pass
                 else:
                     # For development/unfrozen, update via pip
                     python_executable = sys.executable
                     subprocess.run(
                         [python_executable, "-m", "pip", "install", "--upgrade", "yt-dlp"],
                         capture_output=True,
-                        timeout=30,
+                        timeout=60,
                         creationflags=subprocess.CREATE_NO_WINDOW if sys.platform == 'win32' else 0
                     )
             except Exception as e:
-                # Store None if update fails
                 self.ytdlp_exe_path = None
+                self.after(0, lambda: self.update_status(f"yt-dlp update failed: {e}"))
 
         # Run update in background thread so it doesn't block UI
         thread = threading.Thread(target=update, daemon=True)
@@ -420,6 +385,11 @@ class VideoDownloaderApp(ctk.CTk):
         if 'ffmpeg_location' in ydl_opts:
             cmd.extend(['--ffmpeg-location', ydl_opts['ffmpeg_location']])
 
+        # Add postprocessor args
+        if 'postprocessor_args' in ydl_opts:
+            for pp_name, args in ydl_opts['postprocessor_args'].items():
+                cmd.extend(['--postprocessor-args', f'{pp_name}:{" ".join(args)}'])
+
         # Add postprocessors
         if 'postprocessors' in ydl_opts:
             for pp in ydl_opts['postprocessors']:
@@ -443,6 +413,9 @@ class VideoDownloaderApp(ctk.CTk):
 
         # Add URL
         cmd.append(url)
+
+        # Track the last downloaded file path from output
+        last_filepath = None
 
         # Run the command
         creationflags = subprocess.CREATE_NO_WINDOW if sys.platform == 'win32' else 0
@@ -483,10 +456,15 @@ class VideoDownloaderApp(ctk.CTk):
                                 # Thread-safe status update
                                 self.after(0, lambda msg=status_msg: self.update_status(msg, append=False))
                                 break
-                    except:
+                    except Exception:
                         pass
-                elif 'has already been downloaded' in line or 'Destination:' in line:
-                    # Thread-safe status update
+                elif 'Destination:' in line:
+                    # Capture the file path from "Destination: /path/to/file"
+                    dest_match = line.split('Destination:', 1)
+                    if len(dest_match) > 1:
+                        last_filepath = dest_match[1].strip()
+                    self.after(0, lambda l=line: self.update_status(l, append=False))
+                elif 'has already been downloaded' in line:
                     self.after(0, lambda l=line: self.update_status(l, append=False))
             elif line:
                 # Show other important messages
@@ -497,10 +475,13 @@ class VideoDownloaderApp(ctk.CTk):
         process.wait()
 
         if process.returncode != 0:
-            raise Exception(f"yt-dlp.exe failed with return code {process.returncode}")
+            raise Exception(f"yt-dlp failed with return code {process.returncode}")
 
-        # Return a minimal result object
-        return {'title': 'Downloaded'}
+        # Return result with actual file path if captured
+        result = {'title': 'Downloaded'}
+        if last_filepath:
+            result['requested_downloads'] = [{'filepath': last_filepath}]
+        return result
 
     def show_update_dialog(self, new_version, download_url, release_notes):
         """Show dialog asking user if they want to update"""
@@ -525,12 +506,15 @@ class VideoDownloaderApp(ctk.CTk):
         """Download and install the update"""
 
         def download():
+            temp_fd = None
+            temp_path = None
             try:
                 # Show download progress
                 self.after(0, lambda: self.update_status("Downloading update...", append=False))
 
                 # Download the new exe
                 response = requests.get(download_url, stream=True)
+                response.raise_for_status()
                 total_size = int(response.headers.get('content-length', 0))
 
                 # Get current exe path
@@ -540,11 +524,16 @@ class VideoDownloaderApp(ctk.CTk):
                     current_exe = os.path.abspath(__file__)
 
                 current_dir = os.path.dirname(current_exe)
-                temp_new_exe = os.path.join(current_dir, 'LacesTotalMediaDownloader_new.exe')
+                final_path = os.path.join(current_dir, 'LacesTotalMediaDownloader_new.exe')
+
+                # Download to a temp file first, then rename on success
+                temp_fd, temp_path = tempfile.mkstemp(suffix='.exe.tmp', dir=current_dir)
+                os.close(temp_fd)
+                temp_fd = None
 
                 # Download with progress
                 downloaded = 0
-                with open(temp_new_exe, 'wb') as f:
+                with open(temp_path, 'wb') as f:
                     for chunk in response.iter_content(chunk_size=8192):
                         if chunk:
                             f.write(chunk)
@@ -559,8 +548,12 @@ class VideoDownloaderApp(ctk.CTk):
                     raise Exception("Download incomplete - file size mismatch")
 
                 # Verify file exists and has content
-                if not os.path.exists(temp_new_exe) or os.path.getsize(temp_new_exe) < 1000000:
+                if not os.path.exists(temp_path) or os.path.getsize(temp_path) < 1000000:
                     raise Exception("Downloaded file is invalid or too small")
+
+                # Move temp file to final location
+                shutil.move(temp_path, final_path)
+                temp_path = None  # Prevent cleanup since it's been moved
 
                 self.after(0, lambda: self.update_status("Verifying download...", append=False))
 
@@ -577,7 +570,7 @@ class VideoDownloaderApp(ctk.CTk):
                         f.write(f'if exist "{current_exe}" move /Y "{current_exe}" "{old_exe_backup}" 2>nul\n')
                         f.write('timeout /t 1 /nobreak > nul\n')
                         f.write('echo Installing update...\n')
-                        f.write(f'move /Y "{temp_new_exe}" "{current_exe}"\n')
+                        f.write(f'move /Y "{final_path}" "{current_exe}"\n')
                         f.write('if errorlevel 1 (\n')
                         f.write('    echo Update failed! Restoring backup...\n')
                         f.write(f'    if exist "{old_exe_backup}" move /Y "{old_exe_backup}" "{current_exe}"\n')
@@ -610,10 +603,16 @@ class VideoDownloaderApp(ctk.CTk):
                 else:
                     self.after(0, lambda: messagebox.showinfo(
                         "Update Downloaded",
-                        f"Update downloaded to:\n{temp_new_exe}\n\nPlease manually replace the current executable and restart."
+                        f"Update downloaded to:\n{final_path}\n\nPlease manually replace the current executable and restart."
                     ))
 
             except Exception as e:
+                # Clean up temp file on failure
+                if temp_path and os.path.exists(temp_path):
+                    try:
+                        os.remove(temp_path)
+                    except OSError:
+                        pass
                 self.after(0, lambda: messagebox.showerror("Update Failed",
                                                            f"Failed to download update:\n{str(e)}\n\nPlease download the update manually from GitHub."))
 
@@ -628,7 +627,7 @@ class VideoDownloaderApp(ctk.CTk):
                 with open(config_path, 'r') as f:
                     data = json.load(f)
                     return data.get('recent_folders', [])
-        except:
+        except Exception:
             pass
         return []
 
@@ -638,7 +637,7 @@ class VideoDownloaderApp(ctk.CTk):
             config_path = Path.home() / '.lace_downloader_config.json'
             with open(config_path, 'w') as f:
                 json.dump({'recent_folders': self.recent_folders}, f)
-        except:
+        except Exception:
             pass
 
     def add_recent_folder(self, folder):
@@ -687,17 +686,30 @@ class VideoDownloaderApp(ctk.CTk):
 
     def show_ffmpeg_warning(self):
         """Show a warning dialog if ffmpeg is not installed"""
+        if sys.platform == 'win32':
+            install_hint = (
+                "To add FFmpeg:\n"
+                "1. Download ffmpeg from https://ffmpeg.org/download.html\n"
+                "2. Place ffmpeg.exe in the same folder as this app\n"
+                "   OR install it system-wide\n\n"
+                "Then restart the app!"
+            )
+        else:
+            install_hint = (
+                "To install FFmpeg:\n"
+                "  sudo apt install ffmpeg   (Debian/Ubuntu)\n"
+                "  sudo dnf install ffmpeg   (Fedora)\n"
+                "  sudo pacman -S ffmpeg     (Arch)\n\n"
+                "Then restart the app!"
+            )
+
         msg = (
             "FFmpeg Not Found!\n\n"
             "FFmpeg is required for:\n"
             "• Merging video + audio for best quality\n"
             "• Converting to MP3 for audio downloads\n\n"
             "The app will still work but will download single-format files.\n\n"
-            "To add FFmpeg:\n"
-            "1. Download ffmpeg from https://ffmpeg.org/download.html\n"
-            "2. Place ffmpeg.exe in the same folder as this app\n"
-            "   OR install it system-wide\n\n"
-            "Then restart the app!"
+            + install_hint
         )
         messagebox.showwarning("FFmpeg Not Found", msg)
 
@@ -706,11 +718,11 @@ class VideoDownloaderApp(ctk.CTk):
         self.main_frame = ctk.CTkFrame(self, fg_color=self.colors['bg'])
         self.main_frame.pack(fill="both", expand=True, padx=15, pady=15)
 
-        # Header row with title and dark mode toggle
+        # Header row with title and update check button
         self.header_frame = ctk.CTkFrame(self.main_frame, fg_color=self.colors['bg'])
         self.header_frame.pack(fill="x", pady=(0, 20))
 
-        # Title with custom font
+        # Title with custom font — centered
         if self.has_bubblegum:
             title_font = ctk.CTkFont(family="Bubblegum Sans", size=40, weight="bold")
         else:
@@ -737,20 +749,6 @@ class VideoDownloaderApp(ctk.CTk):
             corner_radius=25
         )
         self.check_updates_btn.pack(side="right", padx=(0, 10))
-
-        # Dark mode toggle button
-        self.dark_mode_btn = ctk.CTkButton(
-            self.header_frame,
-            text="🌙",
-            command=self.toggle_dark_mode,
-            width=50,
-            height=50,
-            font=ctk.CTkFont(size=24),
-            fg_color=self.colors['button'],
-            hover_color=self.colors['purple'],
-            corner_radius=25
-        )
-        self.dark_mode_btn.pack(side="right")
 
         # Default font for the rest of the UI
         if self.has_bartino:
@@ -1021,30 +1019,31 @@ class VideoDownloaderApp(ctk.CTk):
     def update_recent_dropdown(self):
         """Update the recent folders dropdown"""
         if self.recent_folders:
-            # Get folder names for display
-            folder_names = []
+            # Use full paths as values to avoid name collisions between
+            # different folders that happen to share the same leaf name
+            display_paths = []
             for folder in self.recent_folders[:10]:
-                folder_name = Path(folder).name or folder
-                # Truncate if too long
-                if len(folder_name) > 20:
-                    folder_name = folder_name[:17] + "..."
-                folder_names.append(folder_name)
+                display = folder
+                if len(display) > 40:
+                    display = "..." + display[-37:]
+                display_paths.append(display)
 
-            self.recent_dropdown.configure(values=folder_names)
+            # Store mapping from display string to full path
+            self._recent_display_to_path = {}
+            for display, full_path in zip(display_paths, self.recent_folders[:10]):
+                self._recent_display_to_path[display] = full_path
+
+            self.recent_dropdown.configure(values=display_paths)
         else:
+            self._recent_display_to_path = {}
             self.recent_dropdown.configure(values=["No recent folders"])
 
     def on_recent_selected(self, choice):
         """Handle recent folder selection"""
         if choice and choice != "No recent folders":
-            # Find the full path from the display name
-            for i, folder in enumerate(self.recent_folders[:10]):
-                folder_name = Path(folder).name or folder
-                if len(folder_name) > 20:
-                    folder_name = folder_name[:17] + "..."
-                if folder_name == choice:
-                    self.output_folder.set(self.recent_folders[i])
-                    break
+            full_path = self._recent_display_to_path.get(choice)
+            if full_path:
+                self.output_folder.set(full_path)
 
     def open_folder(self, path):
         """Open folder in file explorer (cross-platform)"""
@@ -1071,7 +1070,7 @@ class VideoDownloaderApp(ctk.CTk):
             if os.path.exists(sound_path):
                 mixer.music.load(sound_path)
                 mixer.music.play()
-        except:
+        except Exception:
             pass
 
     def show_completion_dialog(self):
@@ -1093,14 +1092,19 @@ class VideoDownloaderApp(ctk.CTk):
         self.status_text.configure(state="normal")
         if not append:
             self.status_text.delete("1.0", "end")
+        else:
+            # Ensure a newline separator before appending
+            current = self.status_text.get("1.0", "end-1c")
+            if current and not current.endswith("\n"):
+                self.status_text.insert("end", "\n")
         self.status_text.insert("end", f"{message}\n")
         self.status_text.see("end")
         self.status_text.configure(state="disabled")
 
     def progress_hook(self, d):
+        """Called from yt-dlp worker thread — schedule all UI updates on the main thread."""
         if d['status'] == 'downloading':
             try:
-                # Parse percentage
                 percent_str = d.get('_percent_str', '0%').strip()
                 percent = float(percent_str.replace('%', '')) / 100.0
 
@@ -1109,17 +1113,171 @@ class VideoDownloaderApp(ctk.CTk):
                 downloaded = d.get('_downloaded_bytes_str', 'N/A')
                 total = d.get('_total_bytes_str', 'N/A')
 
-                # Update progress bar with actual percentage
-                self.progress_bar.set(percent)
-
                 status_msg = f"Downloading: {percent_str} ({downloaded}/{total})\n"
                 status_msg += f"Speed: {speed} | ETA: {eta}"
-                self.update_status(status_msg, append=False)
-            except Exception as e:
+
+                # Thread-safe UI updates via self.after
+                self.after(0, lambda p=percent: self.progress_bar.set(p))
+                self.after(0, lambda msg=status_msg: self.update_status(msg, append=False))
+            except Exception:
                 pass
         elif d['status'] == 'finished':
-            self.progress_bar.set(1.0)
-            self.update_status("So Close! Almost done...", append=False)
+            self.after(0, lambda: self.progress_bar.set(1.0))
+            self.after(0, lambda: self.update_status("So Close! Almost done...", append=False))
+
+    def _build_ydl_opts(self, noplaylist):
+        """Build yt-dlp options dict from the current UI settings.
+
+        Shared by download_media() and download_with_playlist_choice() so that
+        format / postprocessor logic is defined in exactly one place.
+        """
+        output_template = os.path.join(self.output_folder.get(), "%(title)s.%(ext)s")
+        ydl_opts = {
+            'outtmpl': output_template,
+            'noplaylist': noplaylist,
+        }
+
+        # Add ffmpeg location if available
+        if self.ffmpeg_available and self.ffmpeg_path:
+            ydl_opts['ffmpeg_location'] = os.path.dirname(self.ffmpeg_path)
+
+        if self.download_type.get() == "video":
+            quality = self.quality.get()
+            video_format = self.video_format.get()
+
+            if self.ffmpeg_available:
+                # With ffmpeg, we can merge video+audio for best quality
+                if video_format == 'mp4':
+                    # Premiere Pro compatibility: prefer H.264 (avc1) video + AAC (mp4a) audio.
+                    # When these codecs are available, yt-dlp merges to mp4 natively — no re-encode,
+                    # no quality loss.  If the source only has VP9/AV1 (rare for ≤1080p), yt-dlp
+                    # merges into mkv/webm and the FFmpegVideoConvertor postprocessor kicks in to
+                    # re-encode to H.264+AAC mp4, guaranteeing Premiere Pro compatibility.
+                    if quality == "Best":
+                        ydl_opts['format'] = ('bestvideo[vcodec^=avc1]+bestaudio[acodec^=mp4a]/'
+                                              'bestvideo[vcodec^=avc1]+bestaudio/'
+                                              'bestvideo+bestaudio/best')
+                    else:
+                        height = quality.replace('p', '')
+                        ydl_opts['format'] = (f'bestvideo[vcodec^=avc1][height<={height}]+bestaudio[acodec^=mp4a]/'
+                                              f'bestvideo[vcodec^=avc1][height<={height}]+bestaudio/'
+                                              f'bestvideo[height<={height}]+bestaudio/'
+                                              f'best[height<={height}]')
+                    # Do NOT set merge_output_format here — let yt-dlp auto-select the container.
+                    # H.264+AAC → merged as mp4 → converter skips → fast, no re-encode.
+                    # VP9+Opus  → merged as mkv/webm → converter re-encodes to H.264+AAC mp4.
+                    ydl_opts['postprocessors'] = [{
+                        'key': 'FFmpegVideoConvertor',
+                        'preferedformat': 'mp4',
+                    }]
+                    ydl_opts['postprocessor_args'] = {
+                        'videoconvertor': ['-c:v', 'libx264', '-c:a', 'aac', '-preset', 'fast', '-crf', '23']
+                    }
+                else:
+                    # Non-MP4 formats: standard format selection
+                    if quality == "Best":
+                        ydl_opts['format'] = 'bestvideo+bestaudio/best'
+                    else:
+                        height = quality.replace('p', '')
+                        ydl_opts['format'] = f'bestvideo[height<={height}]+bestaudio/best[height<={height}]'
+
+                    # Set merge output format
+                    if video_format in ['mkv', 'webm']:
+                        ydl_opts['merge_output_format'] = video_format
+                    else:
+                        # For other formats (avi, mov, flv), merge as mp4 first then convert
+                        ydl_opts['merge_output_format'] = 'mp4'
+                        ydl_opts['postprocessors'] = [{
+                            'key': 'FFmpegVideoConvertor',
+                            'preferedformat': video_format,  # Note: yt-dlp uses 'prefered' (one r)
+                        }]
+            else:
+                # Without ffmpeg, download pre-merged formats only
+                if quality == "Best":
+                    ydl_opts['format'] = 'best'
+                else:
+                    height = quality.replace('p', '')
+                    ydl_opts['format'] = f'best[height<={height}]/best'
+                self.update_status("Note: Without ffmpeg, using pre-merged format (may have lower quality)")
+        else:
+            audio_format = self.audio_format.get()
+
+            if self.ffmpeg_available:
+                # With ffmpeg, extract and convert to chosen format
+                bitrate = self.audio_quality.get().split()[0]
+                ydl_opts['format'] = 'bestaudio/best'
+
+                # Map format names to codec names
+                codec_map = {
+                    'mp3': 'mp3',
+                    'm4a': 'm4a',
+                    'wav': 'wav',
+                    'flac': 'flac',
+                    'opus': 'opus',
+                    'aac': 'aac',
+                    'ogg': 'vorbis'  # ogg uses vorbis codec
+                }
+
+                codec = codec_map.get(audio_format, audio_format)
+
+                ydl_opts['postprocessors'] = [{
+                    'key': 'FFmpegExtractAudio',
+                    'preferredcodec': codec,
+                    'preferredquality': bitrate,
+                }]
+            else:
+                # Without ffmpeg, just download best audio
+                ydl_opts['format'] = 'bestaudio/best'
+                self.update_status("Note: Without ffmpeg, downloading audio as-is (no conversion)")
+
+        return ydl_opts
+
+    def _run_download_and_finish(self, ydl_opts, url, success_message):
+        """Run the download with the given options and handle result / errors.
+
+        Shared by download_media() and download_with_playlist_choice().
+        Must be called from a worker thread.
+        """
+        self.update_status("Download starting...")
+
+        # Add folder to recent list
+        self.add_recent_folder(self.output_folder.get())
+
+        result = self.run_ytdlp_download(ydl_opts, url)
+        # Try to get the filename
+        if 'requested_downloads' in result and result['requested_downloads']:
+            self.downloaded_file_path = result['requested_downloads'][0].get('filepath')
+
+        self.update_status(success_message)
+        self.progress_bar.set(1)
+
+        # Show completion dialog
+        self.after(100, self.show_completion_dialog)
+
+    def _handle_download_error(self, e):
+        """Format and display a download error. Must be called from a worker thread."""
+        error_msg = str(e)
+
+        # Check for HTTP 403 errors (common when yt-dlp is outdated)
+        if "403" in error_msg or "Forbidden" in error_msg:
+            is_frozen = getattr(sys, 'frozen', False)
+            if is_frozen:
+                error_msg = (
+                    "HTTP 403 Error: YouTube has changed something!\n\n"
+                    "Please check for app updates (you should see an update notification if available).\n"
+                    "If no update is available, please report this issue!\n\n"
+                    f"Technical details: {error_msg}"
+                )
+            else:
+                error_msg = (
+                    "HTTP 403 Error: YouTube has changed something!\n\n"
+                    "yt-dlp is updating in the background. Please try again in a moment.\n"
+                    "If the issue persists, restart the application.\n\n"
+                    f"Technical details: {error_msg}"
+                )
+
+        self.update_status(f"Error: {error_msg}")
+        self.progress_bar.set(0)
 
     def download_media(self, url):
         try:
@@ -1146,137 +1304,13 @@ class VideoDownloaderApp(ctk.CTk):
                 # Ask user in a dialog
                 self.after(0, lambda: self.ask_playlist_download(url, playlist_title, entry_count))
                 return
-            else:
-                noplaylist = True
 
-            # Download options
-            output_template = f"{self.output_folder.get()}/%(title)s.%(ext)s"
-            ydl_opts = {
-                'outtmpl': output_template,
-                'noplaylist': noplaylist,
-            }
-
-            # Add ffmpeg location if available
-            if self.ffmpeg_available and self.ffmpeg_path:
-                ydl_opts['ffmpeg_location'] = os.path.dirname(self.ffmpeg_path)
-
-            if self.download_type.get() == "video":
-                quality = self.quality.get()
-                video_format = self.video_format.get()
-
-                if self.ffmpeg_available:
-                    # With ffmpeg, we can merge video+audio for best quality
-                    if quality == "Best":
-                        ydl_opts['format'] = 'bestvideo+bestaudio/best'
-                    else:
-                        height = quality.replace('p', '')
-                        ydl_opts['format'] = f'bestvideo[height<={height}]+bestaudio/best[height<={height}]'
-
-                    # Set merge output format
-                    if video_format in ['mp4', 'mkv', 'webm']:
-                        ydl_opts['merge_output_format'] = video_format
-                    else:
-                        # For other formats, merge as mp4 first then convert
-                        ydl_opts['merge_output_format'] = 'mp4'
-                        ydl_opts['postprocessors'] = [{
-                            'key': 'FFmpegVideoConvertor',
-                            'preferedformat': video_format,  # Note: yt-dlp uses 'prefered' (one r)
-                        }]
-
-                    # For MP4 format, ensure H.264+AAC codecs for Premiere Pro compatibility
-                    # This prevents issues with VP9/Opus codecs that Premiere Pro doesn't support
-                    if video_format == 'mp4':
-                        if 'postprocessors' not in ydl_opts:
-                            ydl_opts['postprocessors'] = []
-                        ydl_opts['postprocessors'].append({
-                            'key': 'FFmpegVideoConvertor',
-                            'preferedformat': 'mp4',
-                        })
-                        # Force re-encode to H.264 (libx264) video + AAC audio for maximum compatibility
-                        # preset=fast for reasonable encoding speed, crf=23 for good quality
-                        ydl_opts['postprocessor_args'] = {
-                            'videoconvertor': ['-c:v', 'libx264', '-c:a', 'aac', '-preset', 'fast', '-crf', '23']
-                        }
-                else:
-                    # Without ffmpeg, download pre-merged formats only
-                    if quality == "Best":
-                        ydl_opts['format'] = 'best'
-                    else:
-                        height = quality.replace('p', '')
-                        ydl_opts['format'] = f'best[height<={height}]/best'
-                    self.update_status("Note: Without ffmpeg, using pre-merged format (may have lower quality)")
-            else:
-                audio_format = self.audio_format.get()
-
-                if self.ffmpeg_available:
-                    # With ffmpeg, extract and convert to chosen format
-                    bitrate = self.audio_quality.get().split()[0]
-                    ydl_opts['format'] = 'bestaudio/best'
-
-                    # Map format names to codec names
-                    codec_map = {
-                        'mp3': 'mp3',
-                        'm4a': 'm4a',
-                        'wav': 'wav',
-                        'flac': 'flac',
-                        'opus': 'opus',
-                        'aac': 'aac',
-                        'ogg': 'vorbis'  # ogg uses vorbis codec
-                    }
-
-                    codec = codec_map.get(audio_format, audio_format)
-
-                    ydl_opts['postprocessors'] = [{
-                        'key': 'FFmpegExtractAudio',
-                        'preferredcodec': codec,
-                        'preferredquality': bitrate,
-                    }]
-                else:
-                    # Without ffmpeg, just download best audio
-                    ydl_opts['format'] = 'bestaudio/best'
-                    self.update_status("Note: Without ffmpeg, downloading audio as-is (no conversion)")
-
-            self.update_status("Download starting...")
-
-            # Add folder to recent list
-            self.add_recent_folder(self.output_folder.get())
-
-            result = self.run_ytdlp_download(ydl_opts, url)
-            # Try to get the filename
-            if 'requested_downloads' in result and result['requested_downloads']:
-                self.downloaded_file_path = result['requested_downloads'][0].get('filepath')
-
-            self.update_status("Download completed! Yummy output folder so stuffed mmm!")
-            self.progress_bar.set(1)
-
-            # Show completion dialog
-            self.after(100, self.show_completion_dialog)
+            ydl_opts = self._build_ydl_opts(noplaylist=True)
+            self._run_download_and_finish(ydl_opts, url,
+                                          "Download completed! Yummy output folder so stuffed mmm!")
 
         except Exception as e:
-            error_msg = str(e)
-
-            # Check for HTTP 403 errors (common when yt-dlp is outdated)
-            if "403" in error_msg or "Forbidden" in error_msg:
-                is_frozen = getattr(sys, 'frozen', False)
-                if is_frozen:
-                    # For frozen builds, suggest updating the app
-                    error_msg = (
-                        "HTTP 403 Error: YouTube has changed something!\n\n"
-                        "Please check for app updates (you should see an update notification if available).\n"
-                        "If no update is available, please report this issue!\n\n"
-                        f"Technical details: {error_msg}"
-                    )
-                else:
-                    # For development builds, yt-dlp should auto-update
-                    error_msg = (
-                        "HTTP 403 Error: YouTube has changed something!\n\n"
-                        "yt-dlp is updating in the background. Please try again in a moment.\n"
-                        "If the issue persists, restart the application.\n\n"
-                        f"Technical details: {error_msg}"
-                    )
-
-            self.update_status(f"Error: {error_msg}")
-            self.progress_bar.set(0)
+            self._handle_download_error(e)
         finally:
             self.is_downloading = False
             self.download_btn.configure(state="normal", text="DOWNLOAD")
@@ -1307,125 +1341,12 @@ class VideoDownloaderApp(ctk.CTk):
 
     def download_with_playlist_choice(self, url, download_all):
         try:
-            output_template = f"{self.output_folder.get()}/%(title)s.%(ext)s"
-            ydl_opts = {
-                'outtmpl': output_template,
-                'noplaylist': not download_all,
-            }
-
-            # Add ffmpeg location if available
-            if self.ffmpeg_available and self.ffmpeg_path:
-                ydl_opts['ffmpeg_location'] = os.path.dirname(self.ffmpeg_path)
-
-            if self.download_type.get() == "video":
-                quality = self.quality.get()
-                video_format = self.video_format.get()
-
-                if self.ffmpeg_available:
-                    if quality == "Best":
-                        ydl_opts['format'] = 'bestvideo+bestaudio/best'
-                    else:
-                        height = quality.replace('p', '')
-                        ydl_opts['format'] = f'bestvideo[height<={height}]+bestaudio/best[height<={height}]'
-
-                    if video_format in ['mp4', 'mkv', 'webm']:
-                        ydl_opts['merge_output_format'] = video_format
-                    else:
-                        ydl_opts['merge_output_format'] = 'mp4'
-                        ydl_opts['postprocessors'] = [{
-                            'key': 'FFmpegVideoConvertor',
-                            'preferedformat': video_format,
-                        }]
-
-                    # For MP4 format, ensure H.264+AAC codecs for Premiere Pro compatibility
-                    # This prevents issues with VP9/Opus codecs that Premiere Pro doesn't support
-                    if video_format == 'mp4':
-                        if 'postprocessors' not in ydl_opts:
-                            ydl_opts['postprocessors'] = []
-                        ydl_opts['postprocessors'].append({
-                            'key': 'FFmpegVideoConvertor',
-                            'preferedformat': 'mp4',
-                        })
-                        # Force re-encode to H.264 (libx264) video + AAC audio for maximum compatibility
-                        # preset=fast for reasonable encoding speed, crf=23 for good quality
-                        ydl_opts['postprocessor_args'] = {
-                            'videoconvertor': ['-c:v', 'libx264', '-c:a', 'aac', '-preset', 'fast', '-crf', '23']
-                        }
-                else:
-                    if quality == "Best":
-                        ydl_opts['format'] = 'best'
-                    else:
-                        height = quality.replace('p', '')
-                        ydl_opts['format'] = f'best[height<={height}]/best'
-                    self.update_status("Note: Without ffmpeg, using pre-merged format")
-            else:
-                audio_format = self.audio_format.get()
-
-                if self.ffmpeg_available:
-                    bitrate = self.audio_quality.get().split()[0]
-                    ydl_opts['format'] = 'bestaudio/best'
-
-                    codec_map = {
-                        'mp3': 'mp3',
-                        'm4a': 'm4a',
-                        'wav': 'wav',
-                        'flac': 'flac',
-                        'opus': 'opus',
-                        'aac': 'aac',
-                        'ogg': 'vorbis'
-                    }
-
-                    codec = codec_map.get(audio_format, audio_format)
-
-                    ydl_opts['postprocessors'] = [{
-                        'key': 'FFmpegExtractAudio',
-                        'preferredcodec': codec,
-                        'preferredquality': bitrate,
-                    }]
-                else:
-                    ydl_opts['format'] = 'bestaudio/best'
-                    self.update_status("Note: Without ffmpeg, downloading audio as-is")
-
-            self.update_status("Starting download...")
-
-            # Add folder to recent list
-            self.add_recent_folder(self.output_folder.get())
-
-            result = self.run_ytdlp_download(ydl_opts, url)
-            if 'requested_downloads' in result and result['requested_downloads']:
-                self.downloaded_file_path = result['requested_downloads'][0].get('filepath')
-
-            self.update_status("You did it you downloaded yay! Check your output folder!")
-            self.progress_bar.set(1)
-
-            # Show completion dialog
-            self.after(100, self.show_completion_dialog)
+            ydl_opts = self._build_ydl_opts(noplaylist=not download_all)
+            self._run_download_and_finish(ydl_opts, url,
+                                          "You did it you downloaded yay! Check your output folder!")
 
         except Exception as e:
-            error_msg = str(e)
-
-            # Check for HTTP 403 errors (common when yt-dlp is outdated)
-            if "403" in error_msg or "Forbidden" in error_msg:
-                is_frozen = getattr(sys, 'frozen', False)
-                if is_frozen:
-                    # For frozen builds, suggest updating the app
-                    error_msg = (
-                        "HTTP 403 Error: YouTube has changed something!\n\n"
-                        "Please check for app updates (you should see an update notification if available).\n"
-                        "If no update is available, please report this issue!\n\n"
-                        f"Technical details: {error_msg}"
-                    )
-                else:
-                    # For development builds, yt-dlp should auto-update
-                    error_msg = (
-                        "HTTP 403 Error: YouTube has changed something!\n\n"
-                        "yt-dlp is updating in the background. Please try again in a moment.\n"
-                        "If the issue persists, restart the application.\n\n"
-                        f"Technical details: {error_msg}"
-                    )
-
-            self.update_status(f"Error: {error_msg}")
-            self.progress_bar.set(0)
+            self._handle_download_error(e)
         finally:
             self.is_downloading = False
             self.download_btn.configure(state="normal", text="DOWNLOAD")
@@ -1445,7 +1366,7 @@ class VideoDownloaderApp(ctk.CTk):
         if not os.path.exists(output_dir):
             try:
                 os.makedirs(output_dir)
-            except:
+            except Exception:
                 messagebox.showerror("bruh", "Kinda need a valid output folder to output into a folder...")
                 return
 

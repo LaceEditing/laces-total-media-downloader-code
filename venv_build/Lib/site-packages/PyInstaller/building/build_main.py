@@ -66,12 +66,12 @@ IMPORT_TYPES = [
 WARNFILE_HEADER = """\
 
 This file lists modules PyInstaller was not able to find. This does not
-necessarily mean this module is required for running your program. Python and
-Python 3rd-party packages include a lot of conditional or optional modules. For
-example the module 'ntpath' only exists on Windows, whereas the module
-'posixpath' only exists on Posix systems.
+necessarily mean these modules are required for running your program. Both
+Python's standard library and 3rd-party Python packages often conditionally
+import optional modules, some of which may be available only on certain
+platforms.
 
-Types if import:
+Types of import:
 * top-level: imported at the top-level - look at these first
 * conditional: imported within an if-statement
 * delayed: imported within a function
@@ -635,7 +635,7 @@ class Analysis(Target):
         if spec_pathex is not None:
             pathex.extend(spec_pathex)
         # Normalize paths in pathex and make them absolute.
-        return [absnormpath(p) for p in pathex]
+        return list(dict.fromkeys(absnormpath(p) for p in pathex))
 
     def _check_guts(self, data, last_build):
         if Target._check_guts(self, data, last_build):
@@ -1009,9 +1009,12 @@ class Analysis(Target):
         combined_toc = normalize_toc(self.datas + self.binaries)
         combined_toc = toc_process_symbolic_links(combined_toc)
 
-        # On macOS, look for binaries collected from .framework bundles, and collect their Info.plist files.
+        # On macOS, look for binaries collected from .framework bundles, collect their Info.plist files, and fix the
+        # structure to conform to code-signing requirements (i.e., Versions/Current symbolic link and symbolic links
+        # for top-level directories).
         if is_darwin:
-            combined_toc += osxutils.collect_files_from_framework_bundles(combined_toc)
+            combined_toc = osxutils.collect_files_from_framework_bundles(combined_toc)
+            combined_toc = normalize_toc(combined_toc)
 
         self.datas = []
         self.binaries = []
