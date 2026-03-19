@@ -30,21 +30,21 @@ modules:
     sources:
       - type: archive
         url: https://github.com/libsdl-org/SDL/releases/download/release-2.30.10/SDL2-2.30.10.tar.gz
-        sha256: f59adf36a8bcdc22d3e9eff02786e107e2e4b248ef093e7e01faa3580e3ae54c
+        sha256: f59adf36a0fcf4c94198e7d3d776c1b3824211ab7aeebeb31fe19836661196aa
 
   - name: SDL2_mixer
     buildsystem: autotools
     sources:
       - type: archive
         url: https://github.com/libsdl-org/SDL_mixer/releases/download/release-2.8.0/SDL2_mixer-2.8.0.tar.gz
-        sha256: 09cb2bdab9ee0aaf2ff8e8f4c4e66682bcc0c5ef068044f3dc4ae0ddd20f8ecd
+        sha256: 1cfb34c87b26dbdbc7afd68c4f545c0116ab5f90bbfecc5aebe2a9cb4bb31549
 
   - name: SDL2_image
     buildsystem: autotools
     sources:
       - type: archive
         url: https://github.com/libsdl-org/SDL_image/releases/download/release-2.8.4/SDL2_image-2.8.4.tar.gz
-        sha256: 41a5e40b6c8cdd0b1cdac6425b3c0e0f0dbe0fee720e1b6e6edfe7d4d7de3b17
+        sha256: f7c06a8783952cfe960adccdd3d8472b63ab31475b4390d10cfdcc1aea61238f
 
   # ── Python dependencies (pip install at build time) ────────────────
   - name: python-deps
