@@ -1,12 +1,18 @@
-﻿import customtkinter as ctk
+import os
+import sys
+import shutil
+
+# Ensure ~/.fonts exists before CustomTkinter is imported so its shapes font
+# can be installed on Linux (prevents "Y" rendering instead of dropdown arrows)
+if sys.platform.startswith('linux'):
+    os.makedirs(os.path.expanduser('~/.fonts'), exist_ok=True)
+
+import customtkinter as ctk
 from tkinter import filedialog, messagebox
 import yt_dlp
 import threading
-import os
-import sys
 from pathlib import Path
 import re
-import shutil
 import subprocess
 import json
 from pygame import mixer
@@ -153,6 +159,19 @@ class VideoDownloaderApp(ctk.CTk):
             # Font paths
             self.bubblegum_font_path = os.path.join(base_path, 'assets', 'fonts', 'BubblegumSans-Regular.ttf')
             self.bartino_font_path = os.path.join(base_path, 'assets', 'fonts', 'bartino.ttf')
+
+            # On Linux, copy fonts to ~/.fonts so Tk/fontconfig can find them
+            if sys.platform.startswith('linux'):
+                linux_font_dir = os.path.expanduser('~/.fonts')
+                os.makedirs(linux_font_dir, exist_ok=True)
+                for font_file in (self.bubblegum_font_path, self.bartino_font_path):
+                    if os.path.exists(font_file):
+                        dest = os.path.join(linux_font_dir, os.path.basename(font_file))
+                        if not os.path.exists(dest):
+                            try:
+                                shutil.copy(font_file, dest)
+                            except OSError:
+                                pass
 
             # Check if fonts exist
             self.has_bubblegum = os.path.exists(self.bubblegum_font_path)
