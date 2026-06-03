@@ -47,11 +47,12 @@ from pygame import mixer
 import requests
 from packaging import version
 import tempfile
+import webbrowser
 
 
 class VideoDownloaderApp(ctk.CTk):
     # Version of the app - update this with each release
-    CURRENT_VERSION = "3.5.0"
+    CURRENT_VERSION = "3.6.0"
     # GitHub repository for updates
     GITHUB_REPO = "LaceEditing/laces-total-media-downloader"
 
@@ -61,7 +62,7 @@ class VideoDownloaderApp(ctk.CTk):
         # Window setup
         self.title(f"Hey besties let's download those files! (v{CURRENT_VERSION})")
         self.geometry("950x700")
-        self.minsize(900, 650)
+        self.minsize(850, 700)
 
         # Set window icon
         self.set_icon()
@@ -98,9 +99,23 @@ class VideoDownloaderApp(ctk.CTk):
         self.is_downloading = False
         self.ffmpeg_available = self.check_ffmpeg()
         self.downloaded_file_path = None
-        self.recent_folders = self.load_recent_folders()
+
+        # Load persisted config (recent folders, codec prefs)
+        cfg = self.load_config()
+        self.recent_folders = cfg.get('recent_folders', [])
+        self.hires_codec_default = cfg.get('hires_codec_default', 'auto')  # auto|h264|hevc
+        self.ask_hires_codec = cfg.get('ask_hires_codec', True)
+        self.prefer_gpu = True
+
+        # Sign-in source is session-only. Browser cookies are read live by yt-dlp
+        # for YouTube auth; the app does not persist/export them.
+        self.cookies_source = 'none'   # 'none' | browser name | 'file'
+        self.cookies_file = ''
+        self._delete_legacy_cookiefile()
+
         self._recent_display_to_path = {}  # Populated by update_recent_dropdown
         self.ytdlp_exe_path = None  # Will be set if yt-dlp.exe is downloaded
+        self.hw_encoders = {}  # Populated by _detect_hw_encoders: {'h264': enc, 'hevc': enc}
 
         # Load custom fonts
         self.load_custom_fonts()
@@ -110,6 +125,10 @@ class VideoDownloaderApp(ctk.CTk):
         # Show ffmpeg warning if not available
         if not self.ffmpeg_available:
             self.after(500, self.show_ffmpeg_warning)
+
+        # Probe usable GPU encoders in the background so high-res transcodes are fast
+        if self.ffmpeg_available:
+            self.after(200, self._detect_hw_encoders)
 
         # Update yt-dlp on startup to prevent HTTP 403 errors
         self.after(100, self.update_ytdlp)
@@ -127,41 +146,45 @@ class VideoDownloaderApp(ctk.CTk):
 
 
 
-    def set_icon(self):
-        """Set window icon from assets/icons folder"""
+    def set_icon(self, window=None, prefer_png=False):
+        """Set window icon from assets/icons folder."""
+        target = window or self
         try:
             if getattr(sys, 'frozen', False):
                 base_path = sys._MEIPASS
             else:
                 base_path = os.path.dirname(os.path.abspath(__file__))
 
-            # On Linux, prefer PNG icons
-            if sys.platform.startswith('linux'):
-                icon_paths = [
-                    os.path.join(base_path, 'assets', 'icons', 'icon.png'),
-                    os.path.join(base_path, 'assets', 'icons', 'icon.ico'),
-                ]
-            else:
-                # On Windows, prefer ICO
-                icon_paths = [
-                    os.path.join(base_path, 'assets', 'icons', 'icon.ico'),
-                    os.path.join(base_path, 'assets', 'icons', 'icon.png'),
-                ]
+            icon_dir = os.path.join(base_path, 'assets', 'icons')
+            png_path = os.path.join(icon_dir, 'icon.png')
+            ico_path = os.path.join(icon_dir, 'icon.ico')
 
-            for icon_path in icon_paths:
-                if os.path.exists(icon_path):
-                    if icon_path.endswith('.png'):
-                        # For PNG icons, use PhotoImage (works cross-platform)
-                        from PIL import Image, ImageTk
-                        img = Image.open(icon_path)
-                        photo = ImageTk.PhotoImage(img)
-                        self.iconphoto(True, photo)
-                        # Keep a reference to prevent garbage collection
+            # Windows title bars use iconbitmap; iconphoto alone often leaves
+            # CTk/Tk toplevels with the default blue Tk icon.
+            if os.path.exists(ico_path):
+                try:
+                    target.iconbitmap(ico_path)
+                except Exception:
+                    pass
+                try:
+                    target.iconbitmap(default=ico_path)
+                except Exception:
+                    pass
+
+            if os.path.exists(png_path):
+                try:
+                    # For PNG icons, use PhotoImage (works cross-platform)
+                    from PIL import Image, ImageTk
+                    img = Image.open(png_path)
+                    photo = ImageTk.PhotoImage(img)
+                    target.iconphoto(True, photo)
+                    # Keep a reference to prevent garbage collection
+                    if target is self:
                         self._icon_photo = photo
                     else:
-                        # For ICO icons (Windows)
-                        self.iconbitmap(icon_path)
-                    break
+                        target._icon_photo = photo
+                except Exception:
+                    pass
         except Exception:
             # Fallback: try iconbitmap method
             try:
@@ -172,7 +195,14 @@ class VideoDownloaderApp(ctk.CTk):
 
                 icon_path = os.path.join(base_path, 'assets', 'icons', 'icon.png')
                 if os.path.exists(icon_path):
-                    self.iconphoto(True, icon_path)
+                    from PIL import Image, ImageTk
+                    img = Image.open(icon_path)
+                    photo = ImageTk.PhotoImage(img)
+                    target.iconphoto(True, photo)
+                    if target is self:
+                        self._icon_photo = photo
+                    else:
+                        target._icon_photo = photo
             except Exception:
                 pass
 
@@ -340,6 +370,20 @@ class VideoDownloaderApp(ctk.CTk):
 
                     ytdlp_exe_path = os.path.join(app_dir, ytdlp_filename)
 
+                    # If we already have a usable binary, adopt it right away and
+                    # only re-download when it's actually out of date — saves the
+                    # ~30 MB download on every launch.
+                    have_local = (os.path.exists(ytdlp_exe_path)
+                                  and os.path.getsize(ytdlp_exe_path) >= min_size)
+                    if have_local:
+                        self.ytdlp_exe_path = ytdlp_exe_path
+                        installed = self._get_local_ytdlp_version(ytdlp_exe_path)
+                        latest = self._get_latest_ytdlp_version()
+                        if installed and latest and installed == latest:
+                            self.after(0, lambda v=installed: self.update_status(
+                                f"yt-dlp is up to date ({v})."))
+                            return
+
                     # Download to a temp file first, then rename (atomic-ish)
                     temp_path = ytdlp_exe_path + '.tmp'
                     try:
@@ -375,18 +419,45 @@ class VideoDownloaderApp(ctk.CTk):
                     # For development/unfrozen, update via pip
                     python_executable = sys.executable
                     subprocess.run(
-                        [python_executable, "-m", "pip", "install", "--upgrade", "yt-dlp"],
+                        [python_executable, "-m", "pip", "install", "--upgrade", "yt-dlp[default]"],
                         capture_output=True,
                         timeout=60,
                         creationflags=subprocess.CREATE_NO_WINDOW if sys.platform == 'win32' else 0
                     )
             except Exception as e:
-                self.ytdlp_exe_path = None
+                # Keep using an existing local binary if we have one; only clear
+                # the path when there's nothing usable to fall back on.
+                if not (getattr(self, 'ytdlp_exe_path', None)
+                        and os.path.exists(self.ytdlp_exe_path)):
+                    self.ytdlp_exe_path = None
                 self.after(0, lambda: self.update_status(f"yt-dlp update failed: {e}"))
 
         # Run update in background thread so it doesn't block UI
         thread = threading.Thread(target=update, daemon=True)
         thread.start()
+
+    def _get_local_ytdlp_version(self, exe_path):
+        """Return the version string of the local yt-dlp binary, or None."""
+        try:
+            creationflags = subprocess.CREATE_NO_WINDOW if sys.platform == 'win32' else 0
+            result = subprocess.run([exe_path, '--version'], capture_output=True,
+                                    text=True, timeout=15, creationflags=creationflags)
+            if result.returncode == 0:
+                return result.stdout.strip()
+        except Exception:
+            pass
+        return None
+
+    def _get_latest_ytdlp_version(self):
+        """Return the latest yt-dlp release tag from GitHub, or None."""
+        try:
+            response = requests.get(
+                "https://api.github.com/repos/yt-dlp/yt-dlp/releases/latest", timeout=10)
+            if response.status_code == 200:
+                return response.json().get('tag_name', '').strip() or None
+        except Exception:
+            pass
+        return None
 
     def run_ytdlp_download(self, ydl_opts, url):
         """Run yt-dlp download using either external exe or bundled library"""
@@ -403,6 +474,7 @@ class VideoDownloaderApp(ctk.CTk):
         """Run yt-dlp using the bundled Python library"""
         # Make a copy of options to avoid modifying the original
         opts = ydl_opts.copy()
+        self._apply_js_runtime_opts(opts)
         # Add progress hook for library version
         if 'progress_hooks' not in opts:
             opts['progress_hooks'] = [self.progress_hook]
@@ -423,6 +495,29 @@ class VideoDownloaderApp(ctk.CTk):
         # Add format
         if 'format' in ydl_opts:
             cmd.extend(['-f', ydl_opts['format']])
+
+        # Add format sorting (prefer highest res, then H.264/AAC)
+        if 'format_sort' in ydl_opts:
+            cmd.extend(['-S', ','.join(ydl_opts['format_sort'])])
+
+        # Add cookies (browser login or cookies.txt) for age/bot/members-gated videos
+        if 'cookiesfrombrowser' in ydl_opts:
+            cmd.extend(['--cookies-from-browser', ydl_opts['cookiesfrombrowser'][0]])
+        if 'cookiefile' in ydl_opts:
+            cmd.extend(['--cookies', ydl_opts['cookiefile']])
+
+        # Add extractor args (e.g. YouTube player_client selection)
+        if 'extractor_args' in ydl_opts:
+            for extractor, args in ydl_opts['extractor_args'].items():
+                for key, value in args.items():
+                    value_str = ','.join(value) if isinstance(value, (list, tuple)) else str(value)
+                    cmd.extend(['--extractor-args', f'{extractor}:{key}={value_str}'])
+
+        # Add JavaScript runtimes for YouTube EJS/n-challenge solving
+        for runtime_arg in self._get_js_runtime_args():
+            cmd.extend(['--js-runtimes', runtime_arg])
+        for component in ydl_opts.get('remote_components', []):
+            cmd.extend(['--remote-components', component])
 
         # Add merge output format
         if 'merge_output_format' in ydl_opts:
@@ -463,6 +558,7 @@ class VideoDownloaderApp(ctk.CTk):
 
         # Track the last downloaded file path from output
         last_filepath = None
+        last_error_lines = []
 
         # Run the command
         creationflags = subprocess.CREATE_NO_WINDOW if sys.platform == 'win32' else 0
@@ -477,6 +573,13 @@ class VideoDownloaderApp(ctk.CTk):
         # Read output and update progress
         for line in process.stdout:
             line = line.strip()
+            if line and (
+                line.lower().startswith(('error:', 'warning:'))
+                or self._is_auth_error(line)
+                or self._is_js_challenge_error(line)
+            ):
+                last_error_lines.append(line)
+                last_error_lines = last_error_lines[-5:]
             if '[download]' in line:
                 # Parse progress from output
                 if '%' in line:
@@ -522,6 +625,9 @@ class VideoDownloaderApp(ctk.CTk):
         process.wait()
 
         if process.returncode != 0:
+            error_detail = "\n".join(last_error_lines).strip()
+            if error_detail:
+                raise Exception(error_detail)
             raise Exception(f"yt-dlp failed with return code {process.returncode}")
 
         # Return result with actual file path if captured
@@ -666,24 +772,38 @@ class VideoDownloaderApp(ctk.CTk):
         thread = threading.Thread(target=download, daemon=True)
         thread.start()
 
-    def load_recent_folders(self):
-        """Load recent folders from config file"""
+    def load_config(self):
+        """Load the full app config dict from the config file."""
         try:
             config_path = Path.home() / '.lace_downloader_config.json'
             if config_path.exists():
                 with open(config_path, 'r') as f:
-                    data = json.load(f)
-                    return data.get('recent_folders', [])
+                    return json.load(f)
         except Exception:
             pass
-        return []
+        return {}
 
-    def save_recent_folders(self):
-        """Save recent folders to config file"""
+    def save_config(self):
+        """Persist all app settings (recent folders, sign-in, codec prefs)."""
         try:
             config_path = Path.home() / '.lace_downloader_config.json'
+            data = {
+                'recent_folders': self.recent_folders,
+                'hires_codec_default': self.hires_codec_default,
+                'ask_hires_codec': self.ask_hires_codec,
+                'prefer_gpu': self.prefer_gpu,
+            }
             with open(config_path, 'w') as f:
-                json.dump({'recent_folders': self.recent_folders}, f)
+                json.dump(data, f)
+        except Exception:
+            pass
+
+    def _delete_legacy_cookiefile(self):
+        """Remove the old app-managed cookie export, if a previous run made one."""
+        try:
+            legacy_path = Path.home() / '.lace_downloader_youtube_cookies.txt'
+            if legacy_path.exists():
+                legacy_path.unlink()
         except Exception:
             pass
 
@@ -693,7 +813,7 @@ class VideoDownloaderApp(ctk.CTk):
             self.recent_folders.remove(folder)
         self.recent_folders.insert(0, folder)
         self.recent_folders = self.recent_folders[:10]  # Keep 10 recent
-        self.save_recent_folders()
+        self.save_config()
         self.update_recent_dropdown()
 
     def check_ffmpeg(self):
@@ -759,6 +879,204 @@ class VideoDownloaderApp(ctk.CTk):
             + install_hint
         )
         messagebox.showwarning("FFmpeg Not Found", msg)
+
+    # ------------------------------------------------------------------ #
+    #  Hardware (GPU) encoder detection + selection                       #
+    # ------------------------------------------------------------------ #
+    def _detect_hw_encoders(self):
+        """Probe which GPU encoders actually initialize on this machine/driver.
+
+        Runs a tiny real encode for each candidate so brand-new GPUs (e.g.
+        RTX 50-series) that the bundled ffmpeg supports but the installed driver
+        might not are detected correctly — anything that fails is dropped and we
+        fall back to CPU.  Runs in a background thread; result cached in
+        self.hw_encoders as {'h264': encoder, 'hevc': encoder}.
+        """
+        def probe():
+            if not self.ffmpeg_available or not getattr(self, 'ffmpeg_path', None):
+                return
+            candidates = {
+                'h264': ['h264_nvenc', 'h264_qsv', 'h264_amf'],
+                'hevc': ['hevc_nvenc', 'hevc_qsv', 'hevc_amf'],
+            }
+            found = {}
+            for codec, encoders in candidates.items():
+                for enc in encoders:
+                    if self._test_encoder(enc):
+                        found[codec] = enc
+                        break
+            self.hw_encoders = found
+            if found:
+                msg = "GPU encoder ready: " + ", ".join(sorted(set(found.values())))
+            else:
+                msg = "No GPU encoder available — high-res transcodes will use CPU."
+            self.after(0, lambda m=msg: self.update_status(m))
+
+        threading.Thread(target=probe, daemon=True).start()
+
+    def _test_encoder(self, encoder):
+        """Return True if ffmpeg can actually encode one tiny frame with `encoder`
+        using the *same* rate-control flags we'll use for real, so an encoder that
+        exists but rejects our settings (e.g. a driver mismatch) is rejected here."""
+        try:
+            creationflags = subprocess.CREATE_NO_WINDOW if sys.platform == 'win32' else 0
+            result = subprocess.run(
+                [self.ffmpeg_path, '-hide_banner', '-loglevel', 'error',
+                 '-f', 'lavfi', '-i', 'color=c=black:s=256x256:d=0.1',
+                 '-c:v', encoder] + self._encoder_quality_args(encoder) + ['-f', 'null', '-'],
+                capture_output=True, timeout=25, creationflags=creationflags
+            )
+            return result.returncode == 0
+        except Exception:
+            return False
+
+    def _resolve_encoder(self, codec, prefer_gpu=True):
+        """Return the ffmpeg encoder name for `codec` ('h264'|'hevc')."""
+        codec = 'hevc' if codec == 'hevc' else 'h264'
+        if prefer_gpu and self.hw_encoders.get(codec):
+            return self.hw_encoders[codec]
+        return 'libx265' if codec == 'hevc' else 'libx264'
+
+    @staticmethod
+    def _encoder_quality_args(encoder):
+        """Rate-control + pixel-format flags for an encoder (one source of truth,
+        shared by the startup probe and the real transcode)."""
+        table = {
+            'h264_nvenc': ['-preset', 'p5', '-rc', 'vbr', '-cq', '19', '-b:v', '0', '-pix_fmt', 'yuv420p'],
+            'hevc_nvenc': ['-preset', 'p5', '-rc', 'vbr', '-cq', '21', '-b:v', '0', '-pix_fmt', 'yuv420p'],
+            'h264_qsv':   ['-global_quality', '21', '-pix_fmt', 'nv12'],
+            'hevc_qsv':   ['-global_quality', '23', '-pix_fmt', 'nv12'],
+            'h264_amf':   ['-rc', 'cqp', '-qp_i', '20', '-qp_p', '22', '-quality', 'quality', '-pix_fmt', 'yuv420p'],
+            'hevc_amf':   ['-rc', 'cqp', '-qp_i', '22', '-qp_p', '24', '-quality', 'quality', '-pix_fmt', 'yuv420p'],
+            'libx265':    ['-preset', 'fast', '-crf', '20', '-pix_fmt', 'yuv420p'],
+            'libx264':    ['-preset', 'fast', '-crf', '18', '-pix_fmt', 'yuv420p'],
+        }
+        return list(table.get(encoder, ['-preset', 'fast', '-crf', '18', '-pix_fmt', 'yuv420p']))
+
+    def _video_encoder_args(self, codec, prefer_gpu=None):
+        """Build the FFmpegVideoConvertor postprocessor args for an editor-ready mp4.
+
+        Output is always Premiere-friendly: H.264/HEVC in mp4, 8-bit yuv420p,
+        AAC audio, faststart.  HEVC is tagged hvc1 so Premiere/QuickTime accept it.
+        """
+        if prefer_gpu is None:
+            prefer_gpu = True
+        encoder = self._resolve_encoder(codec, prefer_gpu)
+
+        args = ['-c:v', encoder] + self._encoder_quality_args(encoder)
+        if encoder in ('hevc_nvenc', 'hevc_qsv', 'hevc_amf', 'libx265'):
+            args += ['-tag:v', 'hvc1']  # required so Premiere/QuickTime accept HEVC-in-mp4
+        args += ['-c:a', 'aac', '-b:a', '192k', '-movflags', '+faststart']
+        return args
+
+    # ------------------------------------------------------------------ #
+    #  Quality / codec / auth helpers                                     #
+    # ------------------------------------------------------------------ #
+    @staticmethod
+    def _quality_to_height(quality):
+        """Map a quality dropdown label to a max height, or None for 'Best'.
+
+        Handles labels like '1080p', '2160p (4K)', '4320p (8K)'.
+        """
+        if not quality or quality.lower().startswith('best'):
+            return None
+        digits = re.findall(r'\d+', quality)
+        return int(digits[0]) if digits else None
+
+    def _decide_codec(self, target_h):
+        """Pick the transcode codec for an mp4 of height `target_h`.
+
+        Respects a remembered default; otherwise H.264 for <=4K and HEVC for 8K
+        (8K H.264 is impractically slow/large and most GPUs can't encode it).
+        """
+        pref = self.hires_codec_default
+        if pref in ('h264', 'hevc'):
+            return pref
+        if target_h and target_h >= 4320:
+            return 'hevc'
+        return 'h264'
+
+    def _apply_auth_opts(self, ydl_opts, url=None):
+        """Attach cookies + bot/age-gate resilience to a yt-dlp options dict."""
+        src = self.cookies_source
+
+        if src == 'file' and self.cookies_file and os.path.exists(self.cookies_file):
+            ydl_opts['cookiefile'] = self.cookies_file
+        elif src == 'none' and self._is_youtube_url(url):
+            src = self._get_default_browser()
+        if src and src not in ('none', 'file'):
+            ydl_opts['cookiesfrombrowser'] = (src,)
+
+        # Extra YouTube clients help with some age gates / bot checks even
+        # without cookies; 'default' keeps the normal clients available too.
+        extractor_args = ydl_opts.setdefault('extractor_args', {})
+        yt_args = extractor_args.setdefault('youtube', {})
+        yt_args['player_client'] = ['default', 'tv']
+        self._apply_js_runtime_opts(ydl_opts)
+        return ydl_opts
+
+    def _get_js_runtime_args(self):
+        """Return CLI-style JS runtime args for yt-dlp's YouTube EJS solver."""
+        runtime_candidates = (
+            ('deno', ('deno', 'deno.exe')),
+            ('node', ('node', 'node.exe')),
+            ('quickjs', ('qjs', 'qjs.exe')),
+            ('bun', ('bun', 'bun.exe')),
+        )
+
+        args = []
+        for runtime_name, executables in runtime_candidates:
+            exe_path = None
+            for exe_name in executables:
+                exe_path = shutil.which(exe_name)
+                if exe_path:
+                    break
+            if not exe_path:
+                continue
+            # Deno is enabled by default, but passing the detected path makes
+            # frozen builds and unusual PATH setups more predictable.
+            args.append(f'{runtime_name}:{exe_path}')
+        return args
+
+    def _apply_js_runtime_opts(self, ydl_opts):
+        """Attach JS runtime/EJS options for Python-library yt-dlp runs."""
+        runtimes = {}
+        for runtime_arg in self._get_js_runtime_args():
+            name, _, path = runtime_arg.partition(':')
+            runtimes[name] = {'path': path or None}
+        if runtimes:
+            ydl_opts['js_runtimes'] = runtimes
+
+        # Official yt-dlp executables already bundle EJS, and pip installs should
+        # use yt-dlp[default]. This is a fallback for older local environments.
+        ydl_opts.setdefault('remote_components', ['ejs:github'])
+
+    @staticmethod
+    def _is_js_challenge_error(e):
+        """True if YouTube formats failed because EJS/JS runtime support is missing."""
+        low = str(e).lower()
+        signals = (
+            'n challenge solving failed',
+            'supported javascript runtime',
+            'challenge solver script',
+            'only images are available',
+            'js runtimes: none',
+        )
+        return any(s in low for s in signals) or (
+            'requested format is not available' in low and '[youtube]' in low
+        )
+
+    @staticmethod
+    def _is_youtube_url(url):
+        """True when a URL should use YouTube browser auth automatically."""
+        if not url:
+            return False
+        low = str(url).lower()
+        return any(host in low for host in (
+            'youtube.com/',
+            'youtu.be/',
+            'youtube-nocookie.com/',
+        ))
 
     def setup_ui(self):
         # Main container with padding
@@ -888,9 +1206,9 @@ class VideoDownloaderApp(ctk.CTk):
 
         self.video_quality_menu = ctk.CTkOptionMenu(
             self.quality_frame,
-            values=["Best", "1080p", "720p", "480p", "360p"],
+            values=["Best", "4320p (8K)", "2160p (4K)", "1440p", "1080p", "720p", "480p", "360p"],
             variable=self.quality,
-            width=100,
+            width=130,
             height=32,
             font=small_font,
             fg_color=self.colors['button'],
@@ -1057,6 +1375,110 @@ class VideoDownloaderApp(ctk.CTk):
             self.quality_label.configure(text="Bitrate:")
             self.format_label.configure(text="Format:")
 
+    # ------------------------------------------------------------------ #
+    #  On-demand sign-in (shown only when a video needs authentication)   #
+    # ------------------------------------------------------------------ #
+    def _is_auth_error(self, e):
+        """True if the error means the video needs sign-in, or that reading
+        browser cookies failed."""
+        low = str(e).lower()
+        signals = (
+            'confirm your age', 'age-restricted', 'age restricted', 'inappropriate',
+            "confirm you're not a bot", 'not a bot', 'sign in to confirm', 'sign in to view',
+            'members-only', 'members only', 'join this channel', 'private video',
+            'this video is private', 'login required', 'requires authentication',
+            'use --cookies', 'use --cookies-from-browser', 'cookies are no longer valid',
+            'pass cookies to yt-dlp', 'exporting youtube cookies',
+            # browser-cookie extraction problems should use the same sign-in prompt
+            'could not copy', 'failed to decrypt', 'unable to decrypt', 'cookiesfrombrowser',
+        )
+        return any(s in low for s in signals)
+
+    def _get_default_browser(self):
+        """Detect the user's default browser as a yt-dlp browser name (Windows)."""
+        if sys.platform != 'win32':
+            return None
+        try:
+            import winreg
+            key = r'Software\Microsoft\Windows\Shell\Associations\UrlAssociations\https\UserChoice'
+            with winreg.OpenKey(winreg.HKEY_CURRENT_USER, key) as k:
+                progid = (winreg.QueryValueEx(k, 'ProgId')[0] or '').lower()
+            for needle, name in (('firefox', 'firefox'), ('brave', 'brave'), ('msedge', 'edge'),
+                                 ('edge', 'edge'), ('opera', 'opera'), ('vivaldi', 'vivaldi'),
+                                 ('chromium', 'chromium'), ('chrome', 'chrome')):
+                if needle in progid:
+                    return name
+        except Exception:
+            pass
+        return None
+
+    def prompt_signin(self, url, error_msg=None):
+        """Popup shown when a video needs sign-in. Lets the user open their
+        browser to log into YouTube, then retries the download using that
+        browser's cookies. Runs on the main thread."""
+        browser = self._get_default_browser()
+
+        dialog = ctk.CTkToplevel(self)
+        dialog.title("Sign-in required")
+        dialog.configure(fg_color=self.colors['bg'])
+        dialog.geometry("520x240")
+        dialog.resizable(False, False)
+        dialog.transient(self)
+        self.set_icon(dialog)
+
+        ctk.CTkLabel(
+            dialog,
+            text="The video you're trying to download is age-restricted. "
+                 "Please sign in to a YouTube account that's able to access it.",
+            font=ctk.CTkFont(size=14, weight="bold"),
+            text_color=self.colors['text'], justify="left", wraplength=460,
+        ).pack(anchor="w", padx=24, pady=(24, 14))
+
+        initial_status = ""
+        if error_msg and self.cookies_source != 'none':
+            initial_status = (
+                "Still couldn't access it with the current sign-in. If you're using "
+                "Chrome, Edge, or Brave on Windows, try signing in with Firefox."
+            )
+
+        if initial_status:
+            ctk.CTkLabel(dialog, text=initial_status, font=ctk.CTkFont(size=11),
+                         text_color=self.colors['purple'], justify="left", wraplength=460).pack(
+                anchor="w", padx=24, pady=(0, 4))
+
+        def sign_in():
+            try:
+                webbrowser.open("https://www.youtube.com")
+            except Exception:
+                pass
+            self.cookies_source = browser or 'none'
+            dialog.destroy()
+            self.update_status("Sign in to YouTube, then try the download again.", append=False)
+
+        def cancel():
+            dialog.destroy()
+            self.update_status("Download cancelled — sign-in needed for this video.")
+
+        row = ctk.CTkFrame(dialog, fg_color=self.colors['bg'])
+        row.pack(fill="x", padx=24, pady=(18, 18))
+        ctk.CTkButton(row, text="Cancel", command=cancel, width=120, height=40,
+                      fg_color=self.colors['frame_bg'],
+                      hover_color=self.colors['dark_purple']).pack(side="left")
+        ctk.CTkButton(row, text="Sign In", command=sign_in, width=170, height=40,
+                      fg_color=self.colors['button'],
+                      hover_color=self.colors['purple']).pack(side="right")
+
+        dialog.protocol("WM_DELETE_WINDOW", cancel)
+        dialog.after(120, dialog.grab_set)  # modal once the window exists
+
+    def _restart_download(self, url):
+        """Re-run a download for `url` (used after the user signs in)."""
+        self.is_downloading = True
+        self.download_btn.configure(state="disabled", text="Downloading...")
+        self.progress_bar.set(0)
+        self.update_status("Retrying with your YouTube sign-in...", append=False)
+        threading.Thread(target=self.download_media, args=(url,), daemon=True).start()
+
     def browse_folder(self):
         folder = filedialog.askdirectory()
         if folder:
@@ -1172,17 +1594,26 @@ class VideoDownloaderApp(ctk.CTk):
             self.after(0, lambda: self.progress_bar.set(1.0))
             self.after(0, lambda: self.update_status("So Close! Almost done...", append=False))
 
-    def _build_ydl_opts(self, noplaylist):
+    def _build_ydl_opts(self, noplaylist, codec=None, prefer_gpu=None, target_height=None, url=None):
         """Build yt-dlp options dict from the current UI settings.
 
         Shared by download_media() and download_with_playlist_choice() so that
         format / postprocessor logic is defined in exactly one place.
+
+        codec / prefer_gpu override the transcode target for mp4 high-res
+        downloads (set by the per-download codec popup); when omitted they are
+        decided automatically.  target_height is the resolved/probed height of
+        the video (used to decide whether a transcode is needed); None means
+        "Best / unknown" and is treated as high-res.
         """
         output_template = os.path.join(self.output_folder.get(), "%(title)s.%(ext)s")
         ydl_opts = {
             'outtmpl': output_template,
             'noplaylist': noplaylist,
         }
+
+        # Attach cookies + bot/age-gate resilience
+        self._apply_auth_opts(ydl_opts, url)
 
         # Add ffmpeg location if available
         if self.ffmpeg_available and self.ffmpeg_path:
@@ -1191,61 +1622,67 @@ class VideoDownloaderApp(ctk.CTk):
         if self.download_type.get() == "video":
             quality = self.quality.get()
             video_format = self.video_format.get()
+            cap = self._quality_to_height(quality)  # None == Best (no cap)
+            # Effective height: prefer the probed value when we have it.
+            eff_h = cap if target_height is None else target_height
+            # YouTube only serves H.264 up to 1080p; anything taller is VP9/AV1 and
+            # MUST be transcoded to open in Premiere. Unknown (Best/unprobed) is
+            # treated as high-res to be safe.
+            needs_transcode = (eff_h is None) or (eff_h > 1080)
 
             if self.ffmpeg_available:
-                # With ffmpeg, we can merge video+audio for best quality
-                if video_format == 'mp4':
-                    # Premiere Pro compatibility: prefer H.264 (avc1) video + AAC (mp4a) audio.
-                    # When these codecs are available, yt-dlp merges to mp4 natively — no re-encode,
-                    # no quality loss.  If the source only has VP9/AV1 (rare for ≤1080p), yt-dlp
-                    # merges into mkv/webm and the FFmpegVideoConvertor postprocessor kicks in to
-                    # re-encode to H.264+AAC mp4, guaranteeing Premiere Pro compatibility.
-                    if quality == "Best":
-                        ydl_opts['format'] = ('bestvideo[vcodec^=avc1]+bestaudio[acodec^=mp4a]/'
-                                              'bestvideo[vcodec^=avc1]+bestaudio/'
-                                              'bestvideo+bestaudio/best')
-                    else:
-                        height = quality.replace('p', '')
-                        ydl_opts['format'] = (f'bestvideo[vcodec^=avc1][height<={height}]+bestaudio[acodec^=mp4a]/'
-                                              f'bestvideo[vcodec^=avc1][height<={height}]+bestaudio/'
-                                              f'bestvideo[height<={height}]+bestaudio/'
-                                              f'best[height<={height}]')
-                    # Do NOT set merge_output_format here — let yt-dlp auto-select the container.
-                    # H.264+AAC → merged as mp4 → converter skips → fast, no re-encode.
-                    # VP9+Opus  → merged as mkv/webm → converter re-encodes to H.264+AAC mp4.
-                    ydl_opts['postprocessors'] = [{
-                        'key': 'FFmpegVideoConvertor',
-                        'preferedformat': 'mp4',
-                    }]
-                    ydl_opts['postprocessor_args'] = {
-                        'videoconvertor': ['-c:v', 'libx264', '-c:a', 'aac', '-preset', 'fast', '-crf', '23']
-                    }
+                # Pick the highest available resolution; prefer native H.264/AAC
+                # only as a tie-breaker *within* a resolution, so ≤1080p still
+                # grabs H.264 (no re-encode) while 1440p/4K/8K correctly fetch
+                # the VP9/AV1 streams YouTube only offers above 1080p.
+                ydl_opts['format_sort'] = ['res', 'vcodec:h264', 'acodec:aac']
+                if cap is None:
+                    ydl_opts['format'] = 'bestvideo+bestaudio/best'
                 else:
-                    # Non-MP4 formats: standard format selection
-                    if quality == "Best":
-                        ydl_opts['format'] = 'bestvideo+bestaudio/best'
-                    else:
-                        height = quality.replace('p', '')
-                        ydl_opts['format'] = f'bestvideo[height<={height}]+bestaudio/best[height<={height}]'
+                    ydl_opts['format'] = (f'bestvideo[height<={cap}]+bestaudio/'
+                                          f'best[height<={cap}]')
 
-                    # Set merge output format
-                    if video_format in ['mkv', 'webm']:
-                        ydl_opts['merge_output_format'] = video_format
-                    else:
-                        # For other formats (avi, mov, flv), merge as mp4 first then convert
-                        ydl_opts['merge_output_format'] = 'mp4'
+                if video_format == 'mp4':
+                    if needs_transcode:
+                        # Re-encode to an editor-friendly codec. Merge to mkv first so
+                        # FFmpegVideoConvertor ALWAYS runs — otherwise a VP9/AV1 stream
+                        # that yt-dlp muxed straight into .mp4 would be left untouched
+                        # (and unopenable in Premiere), since the converter skips files
+                        # that already match the target container.
+                        if codec is None:
+                            codec = self._decide_codec(eff_h or 0)
+                        ydl_opts['merge_output_format'] = 'mkv'
                         ydl_opts['postprocessors'] = [{
                             'key': 'FFmpegVideoConvertor',
-                            'preferedformat': video_format,  # Note: yt-dlp uses 'prefered' (one r)
+                            'preferedformat': 'mp4',
                         }]
+                        ydl_opts['postprocessor_args'] = {
+                            'videoconvertor': self._video_encoder_args(codec, prefer_gpu)
+                        }
+                        enc = self._resolve_encoder(codec, True if prefer_gpu is None else prefer_gpu)
+                        self.after(0, lambda e=enc: self.update_status(
+                            f"High-res mp4 will be transcoded with {e} for editor compatibility."))
+                    else:
+                        # ≤1080p: native H.264 is available, so just mux into mp4 with
+                        # no video re-encode (audio is forced to AAC for mp4).
+                        ydl_opts['merge_output_format'] = 'mp4'
+                elif video_format in ('mkv', 'webm'):
+                    ydl_opts['merge_output_format'] = video_format
+                else:
+                    # For other formats (avi, mov, flv), merge as mp4 first then convert
+                    ydl_opts['merge_output_format'] = 'mp4'
+                    ydl_opts['postprocessors'] = [{
+                        'key': 'FFmpegVideoConvertor',
+                        'preferedformat': video_format,  # Note: yt-dlp uses 'prefered' (one r)
+                    }]
             else:
                 # Without ffmpeg, download pre-merged formats only
-                if quality == "Best":
+                if cap is None:
                     ydl_opts['format'] = 'best'
                 else:
-                    height = quality.replace('p', '')
-                    ydl_opts['format'] = f'best[height<={height}]/best'
-                self.update_status("Note: Without ffmpeg, using pre-merged format (may have lower quality)")
+                    ydl_opts['format'] = f'best[height<={cap}]/best'
+                self.after(0, lambda: self.update_status(
+                    "Note: Without ffmpeg, using pre-merged format (may have lower quality)"))
         else:
             audio_format = self.audio_format.get()
 
@@ -1265,17 +1702,18 @@ class VideoDownloaderApp(ctk.CTk):
                     'ogg': 'vorbis'  # ogg uses vorbis codec
                 }
 
-                codec = codec_map.get(audio_format, audio_format)
+                acodec = codec_map.get(audio_format, audio_format)
 
                 ydl_opts['postprocessors'] = [{
                     'key': 'FFmpegExtractAudio',
-                    'preferredcodec': codec,
+                    'preferredcodec': acodec,
                     'preferredquality': bitrate,
                 }]
             else:
                 # Without ffmpeg, just download best audio
                 ydl_opts['format'] = 'bestaudio/best'
-                self.update_status("Note: Without ffmpeg, downloading audio as-is (no conversion)")
+                self.after(0, lambda: self.update_status(
+                    "Note: Without ffmpeg, downloading audio as-is (no conversion)"))
 
         return ydl_opts
 
@@ -1285,25 +1723,49 @@ class VideoDownloaderApp(ctk.CTk):
         Shared by download_media() and download_with_playlist_choice().
         Must be called from a worker thread.
         """
-        self.update_status("Download starting...")
+        self.after(0, lambda: self.update_status("Download starting..."))
 
-        # Add folder to recent list
-        self.add_recent_folder(self.output_folder.get())
+        # Add folder to recent list (touches the dropdown — must run on main thread)
+        self.after(0, lambda: self.add_recent_folder(self.output_folder.get()))
 
         result = self.run_ytdlp_download(ydl_opts, url)
         # Try to get the filename
         if 'requested_downloads' in result and result['requested_downloads']:
             self.downloaded_file_path = result['requested_downloads'][0].get('filepath')
 
-        self.update_status(success_message)
-        self.progress_bar.set(1)
+        self.after(0, lambda: self.update_status(success_message))
+        self.after(0, lambda: self.progress_bar.set(1))
 
         # Show completion dialog
         self.after(100, self.show_completion_dialog)
 
-    def _handle_download_error(self, e):
+    def _handle_download_error(self, e, url=None):
         """Format and display a download error. Must be called from a worker thread."""
         error_msg = str(e)
+
+        # Sign-in / age / bot / members wall: keep these out of the status box and
+        # route them through the sign-in dialog, including retry failures.
+        if url and self._is_auth_error(error_msg):
+            self.after(0, lambda msg=error_msg: self.prompt_signin(url, msg))
+            self.after(0, lambda: self.progress_bar.set(0))
+            return
+
+        if self._is_js_challenge_error(error_msg):
+            runtime_args = self._get_js_runtime_args()
+            if runtime_args:
+                runtime_note = (
+                    "A JavaScript runtime was detected and will be used automatically. "
+                    "If this keeps happening, restart the app so yt-dlp can finish updating."
+                )
+            else:
+                runtime_note = (
+                    "Install Deno or Node.js 22+ and restart the app, then try again."
+                )
+            error_msg = (
+                "YouTube needs extra JavaScript challenge support for this video.\n\n"
+                f"{runtime_note}\n\n"
+                f"Technical details: {error_msg}"
+            )
 
         # Check for HTTP 403 errors (common when yt-dlp is outdated)
         if "403" in error_msg or "Forbidden" in error_msg:
@@ -1323,44 +1785,90 @@ class VideoDownloaderApp(ctk.CTk):
                     f"Technical details: {error_msg}"
                 )
 
-        self.update_status(f"Error: {error_msg}")
-        self.progress_bar.set(0)
+        self.after(0, lambda: self.update_status(f"Error: {error_msg}"))
+        self.after(0, lambda: self.progress_bar.set(0))
 
     def download_media(self, url):
         try:
-            self.update_status(f"Peeping that URL: {url}", append=False)
+            self.after(0, lambda: self.update_status(f"Peeping that URL: {url}", append=False))
 
-            # Check if it's a playlist
+            # Pre-scan: detect playlists and (for single videos) the max available
+            # resolution.  extract_flat='in_playlist' keeps playlist scans fast while
+            # still returning full formats for a single video.
             ydl_opts_check = {
                 'quiet': True,
                 'no_warnings': True,
-                'extract_flat': True,
+                'extract_flat': 'in_playlist',
             }
+            self._apply_auth_opts(ydl_opts_check, url)
 
-            with yt_dlp.YoutubeDL(ydl_opts_check) as ydl:
-                info = ydl.extract_info(url, download=False)
-                is_playlist = 'entries' in info
+            info = None
+            is_playlist = False
+            try:
+                with yt_dlp.YoutubeDL(ydl_opts_check) as ydl:
+                    info = ydl.extract_info(url, download=False)
+                    is_playlist = bool(info) and 'entries' in info
+            except Exception as pre_e:
+                pre_error_msg = str(pre_e)
+                # If this looks like a sign-in wall, offer the sign-in popup
+                # instead of failing. Capture the text now; Python clears
+                # exception variables before delayed Tk callbacks run.
+                if self._is_auth_error(pre_error_msg):
+                    self.after(0, lambda msg=pre_error_msg: self.prompt_signin(url, msg))
+                    return
+                # Otherwise (network/other) don't abort — fall back to a single-item
+                # download with the fresh engine, which may still succeed.
+                self.after(0, lambda: self.update_status(
+                    "Couldn't pre-scan the URL; trying as a single download..."))
 
             # Handle playlist - always ask user
             if is_playlist:
                 playlist_title = info.get('title', 'Unknown Playlist')
                 entry_count = len(list(info.get('entries', [])))
 
-                self.update_status(f"Playlist detected: '{playlist_title}' ({entry_count} items)")
+                self.after(0, lambda: self.update_status(
+                    f"Playlist detected: '{playlist_title}' ({entry_count} items)"))
 
                 # Ask user in a dialog
                 self.after(0, lambda: self.ask_playlist_download(url, playlist_title, entry_count))
                 return
 
-            ydl_opts = self._build_ydl_opts(noplaylist=True)
+            # Single video: work out the target height so we can offer a codec
+            # choice for high-res (≥4K) mp4 downloads and decide if a transcode
+            # is needed.  target_h is None when we couldn't determine it (Best on
+            # a URL we failed to pre-scan) — treated downstream as high-res.
+            cap = self._quality_to_height(self.quality.get())
+            max_h = 0
+            if info and info.get('formats'):
+                try:
+                    max_h = max((f.get('height') or 0) for f in info['formats'])
+                except ValueError:
+                    max_h = 0
+            if max_h:
+                target_h = max_h if cap is None else min(cap, max_h)
+            else:
+                target_h = cap  # couldn't probe — fall back to the cap (None == Best)
+
+            wants_codec_prompt = (
+                self.download_type.get() == "video"
+                and self.video_format.get() == "mp4"
+                and self.ffmpeg_available
+                and self.ask_hires_codec
+                and target_h is not None and target_h >= 2160
+            )
+            if wants_codec_prompt:
+                self.after(0, lambda h=target_h: self.ask_codec_choice(url, h))
+                return
+
+            ydl_opts = self._build_ydl_opts(noplaylist=True, target_height=target_h, url=url)
             self._run_download_and_finish(ydl_opts, url,
                                           "Download completed! Yummy output folder so stuffed mmm!")
 
         except Exception as e:
-            self._handle_download_error(e)
+            self._handle_download_error(e, url)
         finally:
             self.is_downloading = False
-            self.download_btn.configure(state="normal", text="DOWNLOAD")
+            self.after(0, lambda: self.download_btn.configure(state="normal", text="DOWNLOAD"))
 
     def ask_playlist_download(self, url, playlist_title, count):
         result = messagebox.askyesnocancel(
@@ -1388,15 +1896,122 @@ class VideoDownloaderApp(ctk.CTk):
 
     def download_with_playlist_choice(self, url, download_all):
         try:
-            ydl_opts = self._build_ydl_opts(noplaylist=not download_all)
+            ydl_opts = self._build_ydl_opts(noplaylist=not download_all, url=url)
             self._run_download_and_finish(ydl_opts, url,
                                           "You did it you downloaded yay! Check your output folder!")
 
         except Exception as e:
-            self._handle_download_error(e)
+            self._handle_download_error(e, url)
         finally:
             self.is_downloading = False
+            self.after(0, lambda: self.download_btn.configure(state="normal", text="DOWNLOAD"))
+
+    def ask_codec_choice(self, url, target_h):
+        """Let the user choose the codec for a high-res (≥4K) mp4 download.
+
+        Runs on the main thread. On confirm it kicks off the download in a worker
+        thread with the chosen codec / encoder.
+        """
+        default_codec = self._decide_codec(target_h)
+        res_label = "8K" if target_h >= 4320 else "4K" if target_h >= 2160 else f"{target_h}p"
+
+        dialog = ctk.CTkToplevel(self)
+        dialog.title("Woah there big guy!")
+        dialog.configure(fg_color=self.colors['bg'])
+        dialog.geometry("500x300")
+        dialog.resizable(False, False)
+        dialog.transient(self)
+        self.set_icon(dialog, prefer_png=True)
+        dialog.after(100, lambda: self.set_icon(dialog, prefer_png=True))
+
+        codec_var = ctk.StringVar(value=default_codec)
+        remember_var = ctk.BooleanVar(value=False)
+
+        content = ctk.CTkFrame(dialog, fg_color=self.colors['bg'])
+        content.pack(expand=True, fill="both", padx=28, pady=(22, 16))
+
+        ctk.CTkLabel(
+            content,
+            text=f"This is a {res_label} video.\n"
+                 "MP4's need to be transcoded in order to import into video editors.",
+            font=ctk.CTkFont(size=14, weight="bold"),
+            text_color=self.colors['text'], justify="center", wraplength=430,
+        ).pack(anchor="center", pady=(0, 14))
+
+        options = ctk.CTkFrame(content, fg_color=self.colors['bg'])
+        options.pack(anchor="center")
+
+        ctk.CTkRadioButton(options, text="H.264  (most universal, will work in Premiere)",
+                           variable=codec_var, value="h264", font=ctk.CTkFont(size=12),
+                           fg_color=self.colors['purple']).pack(anchor="w", pady=4)
+        ctk.CTkRadioButton(options, text="HEVC / H.265  (smaller files, best for 8K)",
+                           variable=codec_var, value="hevc", font=ctk.CTkFont(size=12),
+                           fg_color=self.colors['purple']).pack(anchor="w", pady=4)
+
+        enc_label = ctk.CTkLabel(content, text="", font=ctk.CTkFont(size=11),
+                                 text_color=self.colors['purple'])
+        enc_label.pack(anchor="center", pady=(8, 0))
+
+        def refresh_encoder_label(*_):
+            enc = self._resolve_encoder(codec_var.get(), True)
+            if enc.startswith(('libx', 'lib')):
+                enc_label.configure(text=f"Will encode with: {enc}  (CPU — no supported GPU found)")
+            else:
+                enc_label.configure(text=f"Will encode with: {enc}  (GPU)")
+
+        codec_var.trace_add("write", refresh_encoder_label)
+        refresh_encoder_label()
+
+        ctk.CTkCheckBox(content, text="Don't ask again (remember this as my default)",
+                        variable=remember_var, font=ctk.CTkFont(size=12),
+                        fg_color=self.colors['purple']).pack(anchor="center", pady=(14, 2))
+
+        btn_row = ctk.CTkFrame(content, fg_color=self.colors['bg'])
+        btn_row.pack(anchor="center", pady=(16, 0))
+
+        def cancel():
+            dialog.destroy()
+            self.is_downloading = False
             self.download_btn.configure(state="normal", text="DOWNLOAD")
+            self.progress_bar.set(0)
+            self.update_status("Download cancelled")
+
+        def confirm():
+            chosen_codec = codec_var.get()
+            prefer_gpu = True
+            if remember_var.get():
+                self.hires_codec_default = chosen_codec
+                self.ask_hires_codec = False
+                self.prefer_gpu = True
+                self.save_config()
+            dialog.destroy()
+            threading.Thread(
+                target=self._download_single_with_codec,
+                args=(url, chosen_codec, prefer_gpu, target_h),
+                daemon=True,
+            ).start()
+
+        ctk.CTkButton(btn_row, text="Cancel", command=cancel, width=120, height=38,
+                      fg_color=self.colors['frame_bg'], hover_color=self.colors['dark_purple']).pack(side="left", padx=(0, 36))
+        ctk.CTkButton(btn_row, text="Download", command=confirm, width=120, height=38,
+                      fg_color=self.colors['button'], hover_color=self.colors['purple']).pack(side="right")
+
+        dialog.protocol("WM_DELETE_WINDOW", cancel)
+        dialog.after(120, dialog.grab_set)  # modal once the window exists
+
+    def _download_single_with_codec(self, url, codec, prefer_gpu, target_height=None):
+        """Worker: download a single video with an explicit codec / encoder choice."""
+        try:
+            ydl_opts = self._build_ydl_opts(noplaylist=True, codec=codec,
+                                            prefer_gpu=prefer_gpu, target_height=target_height,
+                                            url=url)
+            self._run_download_and_finish(ydl_opts, url,
+                                          "Download completed! Yummy output folder so stuffed mmm!")
+        except Exception as e:
+            self._handle_download_error(e, url)
+        finally:
+            self.is_downloading = False
+            self.after(0, lambda: self.download_btn.configure(state="normal", text="DOWNLOAD"))
 
     def start_download(self):
         url = self.url_entry.get().strip()

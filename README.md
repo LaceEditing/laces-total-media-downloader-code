@@ -59,7 +59,7 @@ flatpak-builder --force-clean build-dir flatpak/com.laceediting.TotalMediaDownlo
 
 This will:
 - Download and compile SDL2, SDL2_mixer, SDL2_image (required by pygame)
-- `pip install` all Python dependencies (customtkinter, yt-dlp, pygame, requests, etc.)
+- `pip install` all Python dependencies (customtkinter, yt-dlp[default], pygame, requests, etc.)
 - Copy `main.py`, assets, the desktop entry, icon, and launcher script into place
 
 The first build takes a while due to SDL compilation. Subsequent builds use the

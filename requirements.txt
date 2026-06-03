@@ -1,5 +1,5 @@
 customtkinter>=5.2.0
-yt-dlp
+yt-dlp[default]
 pygame>=2.5.0
 requests>=2.31.0
 packaging>=23.0
