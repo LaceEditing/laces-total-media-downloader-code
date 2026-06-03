@@ -100,7 +100,7 @@ class VideoDownloaderApp(ctk.CTk):
         self.ffmpeg_available = self.check_ffmpeg()
         self.downloaded_file_path = None
 
-        # Load persisted config (recent folders, codec prefs)
+        # Load persisted config (recent folders, high-res notice prefs)
         cfg = self.load_config()
         self.recent_folders = cfg.get('recent_folders', [])
         self.hires_codec_default = cfg.get('hires_codec_default', 'auto')  # auto|h264|hevc
@@ -126,10 +126,6 @@ class VideoDownloaderApp(ctk.CTk):
         if not self.ffmpeg_available:
             self.after(500, self.show_ffmpeg_warning)
 
-        # Probe usable GPU encoders in the background so high-res transcodes are fast
-        if self.ffmpeg_available:
-            self.after(200, self._detect_hw_encoders)
-
         # Update yt-dlp on startup to prevent HTTP 403 errors
         self.after(100, self.update_ytdlp)
 
@@ -146,18 +142,25 @@ class VideoDownloaderApp(ctk.CTk):
 
 
 
+    def _get_icon_paths(self):
+        """Return app icon paths from the bundled assets directory."""
+        if getattr(sys, 'frozen', False):
+            base_path = sys._MEIPASS
+        else:
+            base_path = os.path.dirname(os.path.abspath(__file__))
+        icon_dir = os.path.join(base_path, 'assets', 'icons')
+        return {
+            'png': os.path.join(icon_dir, 'icon.png'),
+            'ico': os.path.join(icon_dir, 'icon.ico'),
+        }
+
     def set_icon(self, window=None, prefer_png=False):
         """Set window icon from assets/icons folder."""
         target = window or self
         try:
-            if getattr(sys, 'frozen', False):
-                base_path = sys._MEIPASS
-            else:
-                base_path = os.path.dirname(os.path.abspath(__file__))
-
-            icon_dir = os.path.join(base_path, 'assets', 'icons')
-            png_path = os.path.join(icon_dir, 'icon.png')
-            ico_path = os.path.join(icon_dir, 'icon.ico')
+            paths = self._get_icon_paths()
+            png_path = paths['png']
+            ico_path = paths['ico']
 
             # Windows title bars use iconbitmap; iconphoto alone often leaves
             # CTk/Tk toplevels with the default blue Tk icon.
@@ -205,6 +208,35 @@ class VideoDownloaderApp(ctk.CTk):
                         target._icon_photo = photo
             except Exception:
                 pass
+
+    def set_toplevel_icon(self, dialog):
+        """Apply the app icon to a CTkToplevel, including the Windows title bar."""
+        self.set_icon(dialog)
+
+        try:
+            ico_path = self._get_icon_paths()['ico']
+        except Exception:
+            ico_path = None
+        if not ico_path or not os.path.exists(ico_path):
+            return
+
+        def apply_ico():
+            try:
+                dialog.iconbitmap(ico_path)
+            except Exception:
+                pass
+            try:
+                dialog.wm_iconbitmap(ico_path)
+            except Exception:
+                pass
+            try:
+                dialog.tk.call('wm', 'iconbitmap', dialog._w, ico_path)
+            except Exception:
+                pass
+
+        dialog.after_idle(apply_ico)
+        dialog.after(100, apply_ico)
+        dialog.after(300, apply_ico)
 
     def load_custom_fonts(self):
         """Load custom fonts from assets/fonts folder"""
@@ -1424,7 +1456,7 @@ class VideoDownloaderApp(ctk.CTk):
         dialog.geometry("520x240")
         dialog.resizable(False, False)
         dialog.transient(self)
-        self.set_icon(dialog)
+        self.set_toplevel_icon(dialog)
 
         ctk.CTkLabel(
             dialog,
@@ -1594,17 +1626,15 @@ class VideoDownloaderApp(ctk.CTk):
             self.after(0, lambda: self.progress_bar.set(1.0))
             self.after(0, lambda: self.update_status("So Close! Almost done...", append=False))
 
-    def _build_ydl_opts(self, noplaylist, codec=None, prefer_gpu=None, target_height=None, url=None):
+    def _build_ydl_opts(self, noplaylist, target_height=None, url=None):
         """Build yt-dlp options dict from the current UI settings.
 
         Shared by download_media() and download_with_playlist_choice() so that
         format / postprocessor logic is defined in exactly one place.
 
-        codec / prefer_gpu override the transcode target for mp4 high-res
-        downloads (set by the per-download codec popup); when omitted they are
-        decided automatically.  target_height is the resolved/probed height of
-        the video (used to decide whether a transcode is needed); None means
-        "Best / unknown" and is treated as high-res.
+        target_height is the resolved/probed height of the video (used to decide
+        whether a high-res mp4 request should be saved as mkv instead). None
+        means "Best / unknown" and is treated as high-res.
         """
         output_template = os.path.join(self.output_folder.get(), "%(title)s.%(ext)s")
         ydl_opts = {
@@ -1625,10 +1655,9 @@ class VideoDownloaderApp(ctk.CTk):
             cap = self._quality_to_height(quality)  # None == Best (no cap)
             # Effective height: prefer the probed value when we have it.
             eff_h = cap if target_height is None else target_height
-            # YouTube only serves H.264 up to 1080p; anything taller is VP9/AV1 and
-            # MUST be transcoded to open in Premiere. Unknown (Best/unprobed) is
-            # treated as high-res to be safe.
-            needs_transcode = (eff_h is None) or (eff_h > 1080)
+            # YouTube only serves H.264 up to 1080p; anything taller is usually
+            # VP9/AV1. Instead of slow MP4 transcoding, save those as MKV.
+            needs_mkv_fallback = (eff_h is None) or (eff_h > 1080)
 
             if self.ffmpeg_available:
                 # Pick the highest available resolution; prefer native H.264/AAC
@@ -1643,25 +1672,12 @@ class VideoDownloaderApp(ctk.CTk):
                                           f'best[height<={cap}]')
 
                 if video_format == 'mp4':
-                    if needs_transcode:
-                        # Re-encode to an editor-friendly codec. Merge to mkv first so
-                        # FFmpegVideoConvertor ALWAYS runs — otherwise a VP9/AV1 stream
-                        # that yt-dlp muxed straight into .mp4 would be left untouched
-                        # (and unopenable in Premiere), since the converter skips files
-                        # that already match the target container.
-                        if codec is None:
-                            codec = self._decide_codec(eff_h or 0)
+                    if needs_mkv_fallback:
+                        # 4K+ YouTube streams are commonly VP9/AV1. Muxing to MKV
+                        # keeps the original quality and avoids a long transcode.
                         ydl_opts['merge_output_format'] = 'mkv'
-                        ydl_opts['postprocessors'] = [{
-                            'key': 'FFmpegVideoConvertor',
-                            'preferedformat': 'mp4',
-                        }]
-                        ydl_opts['postprocessor_args'] = {
-                            'videoconvertor': self._video_encoder_args(codec, prefer_gpu)
-                        }
-                        enc = self._resolve_encoder(codec, True if prefer_gpu is None else prefer_gpu)
-                        self.after(0, lambda e=enc: self.update_status(
-                            f"High-res mp4 will be transcoded with {e} for editor compatibility."))
+                        self.after(0, lambda: self.update_status(
+                            "High-res video will be saved as MKV to avoid a slow MP4 conversion."))
                     else:
                         # ≤1080p: native H.264 is available, so just mux into mp4 with
                         # no video re-encode (audio is forced to AAC for mp4).
@@ -1833,10 +1849,10 @@ class VideoDownloaderApp(ctk.CTk):
                 self.after(0, lambda: self.ask_playlist_download(url, playlist_title, entry_count))
                 return
 
-            # Single video: work out the target height so we can offer a codec
-            # choice for high-res (≥4K) mp4 downloads and decide if a transcode
-            # is needed.  target_h is None when we couldn't determine it (Best on
-            # a URL we failed to pre-scan) — treated downstream as high-res.
+            # Single video: work out the target height so we can warn when a
+            # high-res mp4 request will be saved as mkv to avoid conversion.
+            # target_h is None when we couldn't determine it (Best on a URL we
+            # failed to pre-scan) — treated downstream as high-res.
             cap = self._quality_to_height(self.quality.get())
             max_h = 0
             if info and info.get('formats'):
@@ -1849,15 +1865,15 @@ class VideoDownloaderApp(ctk.CTk):
             else:
                 target_h = cap  # couldn't probe — fall back to the cap (None == Best)
 
-            wants_codec_prompt = (
+            wants_highres_notice = (
                 self.download_type.get() == "video"
                 and self.video_format.get() == "mp4"
                 and self.ffmpeg_available
                 and self.ask_hires_codec
                 and target_h is not None and target_h >= 2160
             )
-            if wants_codec_prompt:
-                self.after(0, lambda h=target_h: self.ask_codec_choice(url, h))
+            if wants_highres_notice:
+                self.after(0, lambda h=target_h: self.ask_highres_mkv_notice(url, h))
                 return
 
             ydl_opts = self._build_ydl_opts(noplaylist=True, target_height=target_h, url=url)
@@ -1906,25 +1922,22 @@ class VideoDownloaderApp(ctk.CTk):
             self.is_downloading = False
             self.after(0, lambda: self.download_btn.configure(state="normal", text="DOWNLOAD"))
 
-    def ask_codec_choice(self, url, target_h):
-        """Let the user choose the codec for a high-res (≥4K) mp4 download.
+    def ask_highres_mkv_notice(self, url, target_h):
+        """Warn that a high-res mp4 request will be saved as mkv.
 
         Runs on the main thread. On confirm it kicks off the download in a worker
-        thread with the chosen codec / encoder.
+        thread and lets yt-dlp mux high-res streams without conversion.
         """
-        default_codec = self._decide_codec(target_h)
         res_label = "8K" if target_h >= 4320 else "4K" if target_h >= 2160 else f"{target_h}p"
 
         dialog = ctk.CTkToplevel(self)
         dialog.title("Woah there big guy!")
         dialog.configure(fg_color=self.colors['bg'])
-        dialog.geometry("500x300")
+        dialog.geometry("500x250")
         dialog.resizable(False, False)
         dialog.transient(self)
-        self.set_icon(dialog, prefer_png=True)
-        dialog.after(100, lambda: self.set_icon(dialog, prefer_png=True))
+        self.set_toplevel_icon(dialog)
 
-        codec_var = ctk.StringVar(value=default_codec)
         remember_var = ctk.BooleanVar(value=False)
 
         content = ctk.CTkFrame(dialog, fg_color=self.colors['bg'])
@@ -1933,36 +1946,12 @@ class VideoDownloaderApp(ctk.CTk):
         ctk.CTkLabel(
             content,
             text=f"This is a {res_label} video.\n"
-                 "MP4's need to be transcoded in order to import into video editors.",
+                 "4K+ videos will be downloaded as .mkv in order to ensure compatibility with video editing software.",
             font=ctk.CTkFont(size=14, weight="bold"),
             text_color=self.colors['text'], justify="center", wraplength=430,
-        ).pack(anchor="center", pady=(0, 14))
+        ).pack(anchor="center", pady=(0, 18))
 
-        options = ctk.CTkFrame(content, fg_color=self.colors['bg'])
-        options.pack(anchor="center")
-
-        ctk.CTkRadioButton(options, text="H.264  (most universal, will work in Premiere)",
-                           variable=codec_var, value="h264", font=ctk.CTkFont(size=12),
-                           fg_color=self.colors['purple']).pack(anchor="w", pady=4)
-        ctk.CTkRadioButton(options, text="HEVC / H.265  (smaller files, best for 8K)",
-                           variable=codec_var, value="hevc", font=ctk.CTkFont(size=12),
-                           fg_color=self.colors['purple']).pack(anchor="w", pady=4)
-
-        enc_label = ctk.CTkLabel(content, text="", font=ctk.CTkFont(size=11),
-                                 text_color=self.colors['purple'])
-        enc_label.pack(anchor="center", pady=(8, 0))
-
-        def refresh_encoder_label(*_):
-            enc = self._resolve_encoder(codec_var.get(), True)
-            if enc.startswith(('libx', 'lib')):
-                enc_label.configure(text=f"Will encode with: {enc}  (CPU — no supported GPU found)")
-            else:
-                enc_label.configure(text=f"Will encode with: {enc}  (GPU)")
-
-        codec_var.trace_add("write", refresh_encoder_label)
-        refresh_encoder_label()
-
-        ctk.CTkCheckBox(content, text="Don't ask again (remember this as my default)",
+        ctk.CTkCheckBox(content, text="Don't ask again",
                         variable=remember_var, font=ctk.CTkFont(size=12),
                         fg_color=self.colors['purple']).pack(anchor="center", pady=(14, 2))
 
@@ -1977,34 +1966,28 @@ class VideoDownloaderApp(ctk.CTk):
             self.update_status("Download cancelled")
 
         def confirm():
-            chosen_codec = codec_var.get()
-            prefer_gpu = True
             if remember_var.get():
-                self.hires_codec_default = chosen_codec
                 self.ask_hires_codec = False
-                self.prefer_gpu = True
                 self.save_config()
             dialog.destroy()
             threading.Thread(
-                target=self._download_single_with_codec,
-                args=(url, chosen_codec, prefer_gpu, target_h),
+                target=self._download_single_highres_mkv,
+                args=(url, target_h),
                 daemon=True,
             ).start()
 
         ctk.CTkButton(btn_row, text="Cancel", command=cancel, width=120, height=38,
                       fg_color=self.colors['frame_bg'], hover_color=self.colors['dark_purple']).pack(side="left", padx=(0, 36))
-        ctk.CTkButton(btn_row, text="Download", command=confirm, width=120, height=38,
+        ctk.CTkButton(btn_row, text="Download MKV", command=confirm, width=130, height=38,
                       fg_color=self.colors['button'], hover_color=self.colors['purple']).pack(side="right")
 
         dialog.protocol("WM_DELETE_WINDOW", cancel)
         dialog.after(120, dialog.grab_set)  # modal once the window exists
 
-    def _download_single_with_codec(self, url, codec, prefer_gpu, target_height=None):
-        """Worker: download a single video with an explicit codec / encoder choice."""
+    def _download_single_highres_mkv(self, url, target_height=None):
+        """Worker: download a single high-res video as mkv without transcoding."""
         try:
-            ydl_opts = self._build_ydl_opts(noplaylist=True, codec=codec,
-                                            prefer_gpu=prefer_gpu, target_height=target_height,
-                                            url=url)
+            ydl_opts = self._build_ydl_opts(noplaylist=True, target_height=target_height, url=url)
             self._run_download_and_finish(ydl_opts, url,
                                           "Download completed! Yummy output folder so stuffed mmm!")
         except Exception as e:
