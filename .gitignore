@@ -3,6 +3,16 @@ __pycache__/
 *.py[cod]
 *$py.class
 
+# Auto-downloaded JS runtime (yt-dlp YouTube n-challenge); fetched at runtime
+deno.exe
+deno
+
+# Static Linux ffmpeg/ffprobe dropped next to the spec for the Linux build
+# (downloaded per BUILD_LINUX.md; the Windows .exe builds stay committed)
+/ffmpeg
+/ffprobe
+.venv-linux/
+
 # C extensions
 *.so
 

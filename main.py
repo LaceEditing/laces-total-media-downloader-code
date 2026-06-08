@@ -52,7 +52,7 @@ import webbrowser
 
 class VideoDownloaderApp(ctk.CTk):
     # Version of the app - update this with each release
-    CURRENT_VERSION = "3.6.0"
+    CURRENT_VERSION = "3.6.1"
     # GitHub repository for updates
     GITHUB_REPO = "LaceEditing/laces-total-media-downloader"
 
@@ -126,8 +126,16 @@ class VideoDownloaderApp(ctk.CTk):
         if not self.ffmpeg_available:
             self.after(500, self.show_ffmpeg_warning)
 
+        # Probe usable GPU encoders in the background so high-res transcodes are fast
+        if self.ffmpeg_available:
+            self.after(200, self._detect_hw_encoders)
+
         # Update yt-dlp on startup to prevent HTTP 403 errors
         self.after(100, self.update_ytdlp)
+
+        # Ensure a JavaScript runtime (Deno) exists for YouTube's n-challenge;
+        # downloads one only if none is available.
+        self.after(300, self.ensure_js_runtime)
 
         # Check for updates on startup
         self.after(1000, self.check_for_updates)
@@ -390,15 +398,24 @@ class VideoDownloaderApp(ctk.CTk):
                     else:
                         app_dir = os.path.dirname(os.path.abspath(__file__))
 
-                    # Choose the right binary for the platform
+                    # Choose the right STANDALONE binary for the platform. On
+                    # Linux/macOS the plain "yt-dlp" asset is a Python zipapp that
+                    # needs a system Python — use the self-contained "yt-dlp_linux"
+                    # / "yt-dlp_macos" builds so it works on machines without Python.
+                    base_url = 'https://github.com/yt-dlp/yt-dlp/releases/latest/download/'
+                    min_size = 1_000_000  # Expect at least ~1MB
                     if sys.platform == 'win32':
                         ytdlp_filename = 'yt-dlp.exe'
-                        ytdlp_url = 'https://github.com/yt-dlp/yt-dlp/releases/latest/download/yt-dlp.exe'
-                        min_size = 1_000_000  # Expect at least ~1MB
-                    else:
+                        ytdlp_url = base_url + 'yt-dlp.exe'
+                    elif sys.platform == 'darwin':
                         ytdlp_filename = 'yt-dlp'
-                        ytdlp_url = 'https://github.com/yt-dlp/yt-dlp/releases/latest/download/yt-dlp'
-                        min_size = 1_000_000
+                        ytdlp_url = base_url + 'yt-dlp_macos'
+                    else:
+                        import platform as _platform
+                        machine = _platform.machine().lower()
+                        asset = 'yt-dlp_linux_aarch64' if machine in ('aarch64', 'arm64') else 'yt-dlp_linux'
+                        ytdlp_filename = 'yt-dlp'
+                        ytdlp_url = base_url + asset
 
                     ytdlp_exe_path = os.path.join(app_dir, ytdlp_filename)
 
@@ -1047,22 +1064,56 @@ class VideoDownloaderApp(ctk.CTk):
         self._apply_js_runtime_opts(ydl_opts)
         return ydl_opts
 
+    def _get_bundled_base_paths(self):
+        """Directories to search for bundled binaries (ffmpeg, deno, etc.)."""
+        paths = []
+        if getattr(sys, 'frozen', False):
+            # PyInstaller onefile self-extracts bundled binaries to _MEIPASS;
+            # also check the folder the .exe itself lives in.
+            paths.append(sys._MEIPASS)
+            paths.append(os.path.dirname(sys.executable))
+        else:
+            paths.append(os.path.dirname(os.path.abspath(__file__)))
+        return paths
+
+    def _find_bundled_executable(self, names):
+        """Return the path to a bundled binary matching any of `names`, if present."""
+        for base in self._get_bundled_base_paths():
+            for name in names:
+                for candidate in (
+                    os.path.join(base, name),
+                    os.path.join(base, 'bin', name),
+                ):
+                    if os.path.isfile(candidate) and os.access(candidate, os.X_OK):
+                        return candidate
+        return None
+
     def _get_js_runtime_args(self):
-        """Return CLI-style JS runtime args for yt-dlp's YouTube EJS solver."""
+        """Return CLI-style JS runtime args for yt-dlp's YouTube EJS solver.
+
+        YouTube's n-challenge needs an actual JS engine. A self-contained Deno
+        binary is bundled with the build, so this searches the bundled location
+        FIRST and only then falls back to whatever the user may have installed on
+        PATH. That keeps YouTube downloads working on machines with neither Node
+        nor Deno installed (previously this relied on shutil.which() alone, so it
+        silently depended on the build machine having Node/Deno on PATH).
+        """
         runtime_candidates = (
-            ('deno', ('deno', 'deno.exe')),
-            ('node', ('node', 'node.exe')),
-            ('quickjs', ('qjs', 'qjs.exe')),
-            ('bun', ('bun', 'bun.exe')),
+            ('deno', ('deno.exe', 'deno')),
+            ('node', ('node.exe', 'node')),
+            ('quickjs', ('qjs.exe', 'qjs')),
+            ('bun', ('bun.exe', 'bun')),
         )
 
         args = []
         for runtime_name, executables in runtime_candidates:
-            exe_path = None
-            for exe_name in executables:
-                exe_path = shutil.which(exe_name)
-                if exe_path:
-                    break
+            # Prefer a binary we shipped inside the build, then fall back to PATH.
+            exe_path = self._find_bundled_executable(executables)
+            if not exe_path:
+                for exe_name in executables:
+                    exe_path = shutil.which(exe_name)
+                    if exe_path:
+                        break
             if not exe_path:
                 continue
             # Deno is enabled by default, but passing the detected path makes
@@ -1082,6 +1133,79 @@ class VideoDownloaderApp(ctk.CTk):
         # Official yt-dlp executables already bundle EJS, and pip installs should
         # use yt-dlp[default]. This is a fallback for older local environments.
         ydl_opts.setdefault('remote_components', ['ejs:github'])
+
+    def _runtime_download_dir(self):
+        """Folder to drop an auto-downloaded deno into (next to the .exe / script)."""
+        if getattr(sys, 'frozen', False):
+            return os.path.dirname(sys.executable)
+        return os.path.dirname(os.path.abspath(__file__))
+
+    @staticmethod
+    def _deno_download_url():
+        """Latest-release Deno asset URL for this platform (zip archive)."""
+        base = 'https://github.com/denoland/deno/releases/latest/download/'
+        if sys.platform == 'win32':
+            return base + 'deno-x86_64-pc-windows-msvc.zip'
+        if sys.platform == 'darwin':
+            import platform
+            arch = 'aarch64' if platform.machine().lower() in ('arm64', 'aarch64') else 'x86_64'
+            return base + f'deno-{arch}-apple-darwin.zip'
+        return base + 'deno-x86_64-unknown-linux-gnu.zip'
+
+    def ensure_js_runtime(self):
+        """Make sure a JavaScript runtime is available for YouTube's n-challenge.
+
+        Runs in the background on startup. If a runtime is already available
+        (bundled deno, or deno/node/etc. on PATH) this does nothing. Otherwise it
+        downloads a self-contained Deno into the app folder — the same pattern the
+        app already uses for yt-dlp.exe — so YouTube works on machines that have
+        neither Node nor Deno installed.
+        """
+        def work():
+            # Already have a runtime (bundled, previously downloaded, or on PATH)?
+            if self._get_js_runtime_args():
+                return
+
+            deno_name = 'deno.exe' if sys.platform == 'win32' else 'deno'
+            deno_path = os.path.join(self._runtime_download_dir(), deno_name)
+            if os.path.exists(deno_path):
+                return
+
+            import io
+            import zipfile
+            temp_path = deno_path + '.tmp'
+            try:
+                self.after(0, lambda: self.update_status(
+                    "Setting up YouTube support (one-time Deno download)..."))
+                resp = requests.get(self._deno_download_url(), timeout=180)
+                resp.raise_for_status()
+                with zipfile.ZipFile(io.BytesIO(resp.content)) as z:
+                    member = next((n for n in z.namelist()
+                                   if os.path.basename(n) in ('deno.exe', 'deno')), None)
+                    if not member:
+                        raise Exception("deno binary not found in the downloaded archive")
+                    data = z.read(member)
+                if len(data) < 20_000_000:  # deno is ~95 MB; guard against a bad download
+                    raise Exception("downloaded Deno looks too small / corrupt")
+                with open(temp_path, 'wb') as f:
+                    f.write(data)
+                if sys.platform != 'win32':
+                    os.chmod(temp_path, 0o755)
+                os.replace(temp_path, deno_path)
+                self.after(0, lambda: self.update_status(
+                    "YouTube support ready (Deno installed)."))
+            except Exception as e:
+                self.after(0, lambda err=e: self.update_status(
+                    f"Couldn't set up Deno automatically: {err}\n"
+                    "YouTube may still work; if not, install Deno or Node.js 22+ and restart."))
+            finally:
+                if os.path.exists(temp_path):
+                    try:
+                        os.remove(temp_path)
+                    except OSError:
+                        pass
+
+        threading.Thread(target=work, daemon=True).start()
 
     @staticmethod
     def _is_js_challenge_error(e):
@@ -1775,7 +1899,10 @@ class VideoDownloaderApp(ctk.CTk):
                 )
             else:
                 runtime_note = (
-                    "Install Deno or Node.js 22+ and restart the app, then try again."
+                    "No JavaScript runtime was found yet. The app downloads Deno "
+                    "automatically the first time it's needed — give it a moment and "
+                    "try again. If it keeps failing, install Deno or Node.js 22+ and "
+                    "restart the app."
                 )
             error_msg = (
                 "YouTube needs extra JavaScript challenge support for this video.\n\n"
