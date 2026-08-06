@@ -15,7 +15,7 @@ if sys.platform.startswith('linux'):
     os.makedirs(_fonts_dir, exist_ok=True)
     # Pre-copy the app's own fonts so they are indexed together with CTk's
     _base = os.path.dirname(os.path.abspath(__file__))
-    for _fname in ('BubblegumSans-Regular.ttf', 'bartino.ttf'):
+    for _fname in ('BubblegumSans-Regular.ttf', 'Bartino.ttf'):
         _src = os.path.join(_base, 'assets', 'fonts', _fname)
         _dst = os.path.join(_fonts_dir, _fname)
         if os.path.exists(_src) and not os.path.exists(_dst):
@@ -52,7 +52,7 @@ import webbrowser
 
 class VideoDownloaderApp(ctk.CTk):
     # Version of the app - update this with each release
-    CURRENT_VERSION = "3.6.1"
+    CURRENT_VERSION = "3.7.0"
     # GitHub repository for updates
     GITHUB_REPO = "LaceEditing/laces-total-media-downloader"
 
@@ -111,6 +111,7 @@ class VideoDownloaderApp(ctk.CTk):
         # for YouTube auth; the app does not persist/export them.
         self.cookies_source = 'none'   # 'none' | browser name | 'file'
         self.cookies_file = ''
+        self._signin_dialog = None     # the open sign-in popup, if any
         self._delete_legacy_cookiefile()
 
         self._recent_display_to_path = {}  # Populated by update_recent_dropdown
@@ -256,7 +257,10 @@ class VideoDownloaderApp(ctk.CTk):
 
             # Font paths
             self.bubblegum_font_path = os.path.join(base_path, 'assets', 'fonts', 'BubblegumSans-Regular.ttf')
-            self.bartino_font_path = os.path.join(base_path, 'assets', 'fonts', 'bartino.ttf')
+            # Must match the file's real case — Linux filesystems are case-sensitive,
+            # so 'bartino.ttf' silently failed to load there and the whole UI fell
+            # back to the default font.
+            self.bartino_font_path = os.path.join(base_path, 'assets', 'fonts', 'Bartino.ttf')
 
             # On Linux, copy fonts to ~/.fonts so Tk/fontconfig can find them
             if sys.platform.startswith('linux'):
@@ -1046,15 +1050,26 @@ class VideoDownloaderApp(ctk.CTk):
         return 'h264'
 
     def _apply_auth_opts(self, ydl_opts, url=None):
-        """Attach cookies + bot/age-gate resilience to a yt-dlp options dict."""
+        """Attach cookies + bot/age-gate resilience to a yt-dlp options dict.
+
+        Cookies are only attached once the user has actually signed in through
+        prompt_signin(). Reaching for the default browser's cookies on every
+        YouTube URL used to break *every* download instead of helping: Chromium
+        browsers (Chrome/Edge/Brave) keep their cookie database locked while
+        they're running, and yt-dlp treats that as a fatal error, so nothing
+        downloaded until the user closed their browser. Most videos need no
+        cookies at all, so the first attempt is always made without them.
+        """
         src = self.cookies_source
 
-        if src == 'file' and self.cookies_file and os.path.exists(self.cookies_file):
-            ydl_opts['cookiefile'] = self.cookies_file
-        elif src == 'none' and self._is_youtube_url(url):
-            src = self._get_default_browser()
-        if src and src not in ('none', 'file'):
-            ydl_opts['cookiesfrombrowser'] = (src,)
+        # The sign-in flow is YouTube-only, so keep the cookie store out of
+        # every other site's downloads — a browser that later reopens would
+        # otherwise start breaking unrelated downloads too.
+        if self._is_youtube_url(url):
+            if src == 'file' and self.cookies_file and os.path.exists(self.cookies_file):
+                ydl_opts['cookiefile'] = self.cookies_file
+            elif src and src not in ('none', 'file'):
+                ydl_opts['cookiesfrombrowser'] = (src,)
 
         # Extra YouTube clients help with some age gates / bot checks even
         # without cookies; 'default' keeps the normal clients available too.
@@ -1535,8 +1550,13 @@ class VideoDownloaderApp(ctk.CTk):
     #  On-demand sign-in (shown only when a video needs authentication)   #
     # ------------------------------------------------------------------ #
     def _is_auth_error(self, e):
-        """True if the error means the video needs sign-in, or that reading
-        browser cookies failed."""
+        """True if the site is refusing the video without a signed-in account.
+
+        Cookie *plumbing* failures are deliberately not included — see
+        _is_cookie_source_error(). Treating "I couldn't read your cookies" as
+        "this video is age-restricted" is what made the sign-in popup appear on
+        every single download.
+        """
         low = str(e).lower()
         signals = (
             'confirm your age', 'age-restricted', 'age restricted', 'inappropriate',
@@ -1545,10 +1565,246 @@ class VideoDownloaderApp(ctk.CTk):
             'this video is private', 'login required', 'requires authentication',
             'use --cookies', 'use --cookies-from-browser', 'cookies are no longer valid',
             'pass cookies to yt-dlp', 'exporting youtube cookies',
-            # browser-cookie extraction problems should use the same sign-in prompt
-            'could not copy', 'failed to decrypt', 'unable to decrypt', 'cookiesfrombrowser',
         )
         return any(s in low for s in signals)
+
+    @staticmethod
+    def _is_cookie_source_error(e):
+        """True if yt-dlp could not read the cookie source we handed it.
+
+        That's a local problem (browser running and holding its cookie database
+        open, Windows refusing to decrypt it, missing profile, unreadable
+        cookies.txt) — not the site asking for a login.
+        """
+        low = str(e).lower()
+        signals = (
+            'could not copy', 'cookie database', 'failed to decrypt', 'unable to decrypt',
+            'failed to load cookies', 'cookieloaderror', 'could not find local state',
+            'no encrypted key', 'unknown browser', 'unsupported browser',
+            'does not support profiles', 'could not find firefox', 'invalid netscape format',
+        )
+        return any(s in low for s in signals)
+
+    @staticmethod
+    def _auth_reason(error_msg):
+        """One-line explanation of why the site wants a signed-in account."""
+        low = str(error_msg or '').lower()
+        if 'age' in low or 'inappropriate' in low:
+            return "This video is age-restricted."
+        if 'not a bot' in low:
+            return "YouTube wants to confirm you're not a bot."
+        if 'members' in low or 'join this channel' in low:
+            return "This video is for channel members only."
+        if 'private' in low:
+            return "This video is private."
+        return "This video needs a signed-in YouTube account."
+
+    # yt-dlp browser names -> display names
+    BROWSER_LABELS = {
+        'firefox': 'Firefox', 'chrome': 'Chrome', 'edge': 'Edge', 'brave': 'Brave',
+        'chromium': 'Chromium', 'opera': 'Opera', 'vivaldi': 'Vivaldi', 'safari': 'Safari',
+    }
+    # Browsers whose cookie store yt-dlp cannot read while the browser is open
+    CHROMIUM_BROWSERS = ('chrome', 'edge', 'brave', 'chromium', 'opera', 'vivaldi')
+
+    @classmethod
+    def _browser_label(cls, source):
+        if source == 'file':
+            return 'the cookies.txt file'
+        return cls.BROWSER_LABELS.get(source, str(source).title())
+
+    def _browser_profile_dirs(self):
+        """Where each browser keeps the profile yt-dlp reads cookies from."""
+        home = str(Path.home())
+        if sys.platform == 'win32':
+            local = os.environ.get('LOCALAPPDATA', os.path.join(home, 'AppData', 'Local'))
+            roaming = os.environ.get('APPDATA', os.path.join(home, 'AppData', 'Roaming'))
+            return {
+                'firefox': [os.path.join(roaming, 'Mozilla', 'Firefox')],
+                'chrome': [os.path.join(local, 'Google', 'Chrome', 'User Data')],
+                'edge': [os.path.join(local, 'Microsoft', 'Edge', 'User Data')],
+                'brave': [os.path.join(local, 'BraveSoftware', 'Brave-Browser', 'User Data')],
+                'chromium': [os.path.join(local, 'Chromium', 'User Data')],
+                'opera': [os.path.join(roaming, 'Opera Software', 'Opera Stable')],
+                'vivaldi': [os.path.join(local, 'Vivaldi', 'User Data')],
+            }
+        if sys.platform == 'darwin':
+            support = os.path.join(home, 'Library', 'Application Support')
+            return {
+                'firefox': [os.path.join(support, 'Firefox')],
+                'chrome': [os.path.join(support, 'Google', 'Chrome')],
+                'edge': [os.path.join(support, 'Microsoft Edge')],
+                'brave': [os.path.join(support, 'BraveSoftware', 'Brave-Browser')],
+                'chromium': [os.path.join(support, 'Chromium')],
+                'opera': [os.path.join(support, 'com.operasoftware.Opera')],
+                'vivaldi': [os.path.join(support, 'Vivaldi')],
+                'safari': [os.path.join(home, 'Library', 'Cookies')],
+            }
+        # Linux (including the flatpak sandbox's view of the host dirs)
+        cfg = os.environ.get('XDG_CONFIG_HOME', os.path.join(home, '.config'))
+        return {
+            'firefox': [os.path.join(home, '.mozilla', 'firefox'),
+                        os.path.join(home, 'snap', 'firefox', 'common', '.mozilla', 'firefox'),
+                        os.path.join(home, '.var', 'app', 'org.mozilla.firefox', '.mozilla', 'firefox')],
+            'chrome': [os.path.join(cfg, 'google-chrome')],
+            'edge': [os.path.join(cfg, 'microsoft-edge')],
+            'brave': [os.path.join(cfg, 'BraveSoftware', 'Brave-Browser'),
+                      os.path.join(home, '.var', 'app', 'com.brave.Browser', 'config',
+                                   'BraveSoftware', 'Brave-Browser')],
+            'chromium': [os.path.join(cfg, 'chromium'),
+                         os.path.join(home, 'snap', 'chromium', 'common', 'chromium')],
+            'opera': [os.path.join(cfg, 'opera')],
+            'vivaldi': [os.path.join(cfg, 'vivaldi')],
+        }
+
+    def _available_browsers(self):
+        """Installed browsers yt-dlp can read cookies from, best choice first.
+
+        Firefox leads because it is the only browser whose cookies stay
+        readable on Windows while it's running.
+        """
+        found = [name for name, dirs in self._browser_profile_dirs().items()
+                 if any(os.path.isdir(d) for d in dirs)]
+        default = self._get_default_browser()
+        order = {'firefox': 0}
+        found.sort(key=lambda n: (order.get(n, 1), n != default, n))
+        return found
+
+    def _browser_executable(self, browser):
+        """Path to a browser's executable, so we can open YouTube in *that* one."""
+        if sys.platform == 'win32':
+            prog = os.environ.get('ProgramFiles', r'C:\Program Files')
+            prog86 = os.environ.get('ProgramFiles(x86)', r'C:\Program Files (x86)')
+            local = os.environ.get('LOCALAPPDATA', '')
+            candidates = {
+                'firefox': [os.path.join(p, 'Mozilla Firefox', 'firefox.exe') for p in (prog, prog86)],
+                'chrome': [os.path.join(p, 'Google', 'Chrome', 'Application', 'chrome.exe')
+                           for p in (prog, prog86, local)],
+                'edge': [os.path.join(p, 'Microsoft', 'Edge', 'Application', 'msedge.exe')
+                         for p in (prog86, prog)],
+                'brave': [os.path.join(p, 'BraveSoftware', 'Brave-Browser', 'Application', 'brave.exe')
+                          for p in (prog, prog86, local)],
+                'chromium': [os.path.join(p, 'Chromium', 'Application', 'chrome.exe')
+                             for p in (prog, prog86, local)],
+                'opera': [os.path.join(local, 'Programs', 'Opera', 'opera.exe')],
+                'vivaldi': [os.path.join(p, 'Vivaldi', 'Application', 'vivaldi.exe')
+                            for p in (prog, local)],
+            }.get(browser, [])
+            for path in candidates:
+                if path and os.path.isfile(path):
+                    return path
+            return None
+        names = {
+            'firefox': ('firefox',), 'chrome': ('google-chrome', 'google-chrome-stable', 'chrome'),
+            'edge': ('microsoft-edge', 'microsoft-edge-stable'), 'brave': ('brave-browser', 'brave'),
+            'chromium': ('chromium', 'chromium-browser'), 'opera': ('opera',), 'vivaldi': ('vivaldi',),
+        }.get(browser, ())
+        for name in names:
+            path = shutil.which(name)
+            if path:
+                return path
+        return None
+
+    def _open_youtube_in(self, browser):
+        """Open YouTube in `browser`, falling back to the system default."""
+        exe = self._browser_executable(browser)
+        if exe:
+            try:
+                subprocess.Popen([exe, 'https://www.youtube.com'])
+                return
+            except Exception:
+                pass
+        try:
+            webbrowser.open('https://www.youtube.com')
+        except Exception:
+            pass
+
+    class _QuietCookieLogger:
+        """Swallow yt-dlp's cookie chatter while we're only probing."""
+
+        def debug(self, message, **kwargs):
+            pass
+
+        info = warning = error = debug
+
+    @staticmethod
+    def _has_youtube_login(jar):
+        """True if a cookie jar actually carries a signed-in YouTube session."""
+        login_names = {'sid', 'sapisid', 'hsid', 'ssid', 'apisid',
+                       '__secure-1psid', '__secure-3psid'}
+        for cookie in jar:
+            domain = (cookie.domain or '').lower()
+            if cookie.name.lower() in login_names and (
+                    'youtube.com' in domain or 'google.com' in domain):
+                return True
+        return False
+
+    def _cookie_problem_message(self, source, error):
+        """Turn a cookie-reading failure into advice the user can act on."""
+        low = str(error).lower()
+        label = self._browser_label(source)
+        if 'could not find' in low or 'no such file' in low or 'unknown browser' in low \
+                or 'unsupported' in low or 'no encrypted key' in low:
+            return f"No {label} profile with saved cookies was found on this computer."
+        if 'could not copy' in low or 'cookie database' in low or 'permission' in low:
+            return (f"{label} is still running, so it's holding its cookie database open. "
+                    f"Close {label} completely (check the system tray), then click "
+                    f"Retry Download — or sign in with Firefox instead, which doesn't "
+                    f"have to be closed.")
+        if 'decrypt' in low:
+            return (f"Windows won't let yt-dlp decrypt {label}'s saved cookies. "
+                    f"Sign in with Firefox instead, or use a cookies.txt file.")
+        if 'netscape' in low or (source == 'file' and 'invalid' in low):
+            return ("That cookies.txt file couldn't be read. Export it again in "
+                    "Netscape format.")
+        return f"Couldn't read cookies from {label}: {error}"
+
+    def _verify_cookie_source(self, source):
+        """Check we can read a signed-in session from `source` before retrying.
+
+        Returns (ok, problem). Verifying up front is what keeps the popup from
+        looping: a source that can't be read is explained here instead of
+        failing the download all over again.
+        """
+        from yt_dlp.cookies import extract_cookies_from_browser, YoutubeDLCookieJar
+        try:
+            if source == 'file':
+                if not self.cookies_file or not os.path.exists(self.cookies_file):
+                    return False, "Choose a cookies.txt file first."
+                jar = YoutubeDLCookieJar(self.cookies_file)
+                jar.load()
+            else:
+                jar = extract_cookies_from_browser(source, logger=self._QuietCookieLogger())
+        except Exception as e:
+            return False, self._cookie_problem_message(source, e)
+
+        if not self._has_youtube_login(jar):
+            return False, (f"{self._browser_label(source)} doesn't have a YouTube sign-in "
+                           f"saved. Click Open YouTube, sign in there, then click "
+                           f"Retry Download.")
+        return True, ''
+
+    def _use_signin_source(self, url, source, dialog=None, on_problem=None):
+        """Switch to `source` and restart the download for `url` with it.
+
+        Returns True when the retry actually started. A source we can't read is
+        reported through `on_problem` and left unset, so the download is never
+        retried with cookies that are already known to fail.
+        """
+        ok, problem = self._verify_cookie_source(source)
+        if not ok:
+            if on_problem:
+                on_problem(problem)
+            return False
+
+        self.cookies_source = source
+        if dialog is not None:
+            try:
+                dialog.destroy()
+            except Exception:
+                pass
+        self._restart_download(url)
+        return True
 
     def _get_default_browser(self):
         """Detect the user's default browser as a yt-dlp browser name (Windows)."""
@@ -1568,61 +1824,180 @@ class VideoDownloaderApp(ctk.CTk):
             pass
         return None
 
-    def prompt_signin(self, url, error_msg=None):
-        """Popup shown when a video needs sign-in. Lets the user open their
-        browser to log into YouTube, then retries the download using that
-        browser's cookies. Runs on the main thread."""
-        browser = self._get_default_browser()
+    def _route_auth_failure(self, url, error_msg):
+        """Show the sign-in dialog when a failure is about authentication.
+
+        Returns True when the error was handled, so callers stop treating it as
+        an ordinary download error. Cookie-reading failures get their own
+        explanation and drop the unusable source, so the next plain attempt
+        isn't poisoned by it.
+        """
+        # The popup can only help with YouTube; anything else gets the plain
+        # error message rather than a sign-in prompt it can't act on.
+        if not self._is_youtube_url(url):
+            return False
+
+        source = self.cookies_source
+        if source != 'none' and self._is_cookie_source_error(error_msg):
+            problem = self._cookie_problem_message(source, error_msg)
+            self.cookies_source = 'none'
+            self.after(0, lambda: self.prompt_signin(
+                url, cookie_problem=problem, preselect=source))
+            return True
+
+        if self._is_auth_error(error_msg):
+            self.after(0, lambda msg=error_msg: self.prompt_signin(url, msg))
+            return True
+        return False
+
+    def prompt_signin(self, url, error_msg=None, cookie_problem=None, preselect=None):
+        """Popup shown when a video needs a signed-in YouTube account.
+
+        The user picks a browser they're signed into (or a cookies.txt export),
+        signs in there, and Retry Download restarts the download with those
+        cookies. The choice is checked before the retry, so a cookie store we
+        can't read explains itself here instead of failing the download again.
+        Runs on the main thread.
+        """
+        existing = getattr(self, '_signin_dialog', None)
+        if existing is not None:
+            try:
+                existing.lift()
+                existing.focus_force()
+                return
+            except Exception:
+                self._signin_dialog = None
+
+        browsers = self._available_browsers()
+        cookies_label = "cookies.txt file..."
+        labels = [self._browser_label(b) for b in browsers]
+        label_to_browser = dict(zip(labels, browsers))
+        labels.append(cookies_label)
+
+        if preselect in browsers:
+            initial = self._browser_label(preselect)
+        elif preselect == 'file' or (self.cookies_source == 'file' and self.cookies_file):
+            initial = cookies_label
+        elif self.cookies_source in browsers:
+            initial = self._browser_label(self.cookies_source)
+        else:
+            initial = labels[0]
 
         dialog = ctk.CTkToplevel(self)
+        self._signin_dialog = dialog
         dialog.title("Sign-in required")
         dialog.configure(fg_color=self.colors['bg'])
-        dialog.geometry("520x240")
+        dialog.geometry("560x400")
         dialog.resizable(False, False)
         dialog.transient(self)
         self.set_toplevel_icon(dialog)
 
         ctk.CTkLabel(
             dialog,
-            text="The video you're trying to download is age-restricted. "
-                 "Please sign in to a YouTube account that's able to access it.",
+            text=f"{self._auth_reason(error_msg)} Sign in to a YouTube account "
+                 f"that can watch it and the download will pick up from there.",
             font=ctk.CTkFont(size=14, weight="bold"),
-            text_color=self.colors['text'], justify="left", wraplength=460,
-        ).pack(anchor="w", padx=24, pady=(24, 14))
+            text_color=self.colors['text'], justify="left", wraplength=500,
+        ).pack(anchor="w", padx=24, pady=(24, 12))
 
-        initial_status = ""
-        if error_msg and self.cookies_source != 'none':
-            initial_status = (
-                "Still couldn't access it with the current sign-in. If you're using "
-                "Chrome, Edge, or Brave on Windows, try signing in with Firefox."
-            )
-
-        if initial_status:
-            ctk.CTkLabel(dialog, text=initial_status, font=ctk.CTkFont(size=11),
-                         text_color=self.colors['purple'], justify="left", wraplength=460).pack(
-                anchor="w", padx=24, pady=(0, 4))
-
-        def sign_in():
-            try:
-                webbrowser.open("https://www.youtube.com")
-            except Exception:
-                pass
-            self.cookies_source = browser or 'none'
-            dialog.destroy()
-            self.update_status("Sign in to YouTube, then try the download again.", append=False)
-
-        def cancel():
-            dialog.destroy()
-            self.update_status("Download cancelled — sign-in needed for this video.")
+        choice = ctk.StringVar(value=initial)
 
         row = ctk.CTkFrame(dialog, fg_color=self.colors['bg'])
-        row.pack(fill="x", padx=24, pady=(18, 18))
-        ctk.CTkButton(row, text="Cancel", command=cancel, width=120, height=40,
+        row.pack(fill="x", padx=24, pady=(0, 6))
+        ctk.CTkLabel(row, text="Sign in with:", font=ctk.CTkFont(size=12),
+                     text_color=self.colors['text']).pack(side="left", padx=(0, 10))
+        ctk.CTkOptionMenu(row, variable=choice, values=labels, width=170,
+                          fg_color=self.colors['frame_bg'],
+                          button_color=self.colors['button'],
+                          button_hover_color=self.colors['purple'],
+                          command=lambda _=None: refresh_hint()).pack(side="left")
+        ctk.CTkButton(row, text="Open YouTube", width=140, height=32,
+                      command=lambda: open_browser(),
+                      fg_color=self.colors['frame_bg'],
+                      hover_color=self.colors['dark_purple']).pack(side="left", padx=(10, 0))
+
+        hint = ctk.CTkLabel(dialog, text="", font=ctk.CTkFont(size=11),
+                            text_color=self.colors['text'], justify="left", wraplength=500)
+        hint.pack(anchor="w", padx=24, pady=(6, 0))
+
+        status = ctk.CTkLabel(dialog, text="", font=ctk.CTkFont(size=11),
+                              text_color=self.colors['purple'], justify="left", wraplength=500)
+        status.pack(anchor="w", padx=24, pady=(10, 0))
+        if cookie_problem:
+            status.configure(text=cookie_problem)
+        elif error_msg and self.cookies_source != 'none':
+            status.configure(text=f"{self._browser_label(self.cookies_source)}'s sign-in "
+                                  f"couldn't open this video. Try another account or browser.")
+
+        def current_source():
+            return label_to_browser.get(choice.get(), 'file')
+
+        def refresh_hint():
+            src = current_source()
+            if src == 'file':
+                hint.configure(text="Export cookies.txt from a browser you're signed into "
+                                    "YouTube with (any \"Get cookies.txt\" extension), then "
+                                    "click Retry Download.")
+            elif src in self.CHROMIUM_BROWSERS:
+                hint.configure(text=f"{self._browser_label(src)} has to be closed completely "
+                                    f"before its cookies can be read — Windows keeps the "
+                                    f"cookie file locked while it's open.")
+            else:
+                hint.configure(text=f"{self._browser_label(src)} can stay open while the "
+                                    f"download runs.")
+
+        def pick_cookie_file():
+            path = filedialog.askopenfilename(
+                parent=dialog, title="Select cookies.txt",
+                filetypes=[("Cookie files", "*.txt"), ("All files", "*.*")])
+            if path:
+                self.cookies_file = path
+                choice.set(cookies_label)
+                refresh_hint()
+                status.configure(text=f"{os.path.basename(path)} selected — "
+                                      f"click Retry Download.")
+
+        def open_browser():
+            src = current_source()
+            if src == 'file':
+                pick_cookie_file()
+                return
+            self._open_youtube_in(src)
+            status.configure(text=f"Sign in to YouTube in {self._browser_label(src)}, "
+                                  f"then click Retry Download.")
+
+        def retry():
+            src = current_source()
+            if src == 'file' and not self.cookies_file:
+                pick_cookie_file()
+                return
+            status.configure(text=f"Checking your {self._browser_label(src)} sign-in...")
+            retry_btn.configure(state="disabled")
+            dialog.update_idletasks()
+            started = self._use_signin_source(
+                url, src, dialog=dialog,
+                on_problem=lambda msg: status.configure(text=msg))
+            if started:
+                self._signin_dialog = None
+            else:
+                retry_btn.configure(state="normal")
+
+        def cancel():
+            self._signin_dialog = None
+            dialog.destroy()
+            self.update_status("Download cancelled — this video needs a YouTube sign-in.")
+
+        row2 = ctk.CTkFrame(dialog, fg_color=self.colors['bg'])
+        row2.pack(fill="x", side="bottom", padx=24, pady=(18, 20))
+        ctk.CTkButton(row2, text="Cancel", command=cancel, width=110, height=40,
                       fg_color=self.colors['frame_bg'],
                       hover_color=self.colors['dark_purple']).pack(side="left")
-        ctk.CTkButton(row, text="Sign In", command=sign_in, width=170, height=40,
-                      fg_color=self.colors['button'],
-                      hover_color=self.colors['purple']).pack(side="right")
+        retry_btn = ctk.CTkButton(row2, text="Retry Download", command=retry, width=170,
+                                  height=40, fg_color=self.colors['button'],
+                                  hover_color=self.colors['purple'])
+        retry_btn.pack(side="right")
+
+        refresh_hint()
 
         dialog.protocol("WM_DELETE_WINDOW", cancel)
         dialog.after(120, dialog.grab_set)  # modal once the window exists
@@ -1883,10 +2258,9 @@ class VideoDownloaderApp(ctk.CTk):
         """Format and display a download error. Must be called from a worker thread."""
         error_msg = str(e)
 
-        # Sign-in / age / bot / members wall: keep these out of the status box and
-        # route them through the sign-in dialog, including retry failures.
-        if url and self._is_auth_error(error_msg):
-            self.after(0, lambda msg=error_msg: self.prompt_signin(url, msg))
+        # Sign-in / age / bot / members wall (and unreadable cookie stores): keep
+        # these out of the status box and route them through the sign-in dialog.
+        if self._route_auth_failure(url, error_msg):
             self.after(0, lambda: self.progress_bar.set(0))
             return
 
@@ -1956,8 +2330,7 @@ class VideoDownloaderApp(ctk.CTk):
                 # If this looks like a sign-in wall, offer the sign-in popup
                 # instead of failing. Capture the text now; Python clears
                 # exception variables before delayed Tk callbacks run.
-                if self._is_auth_error(pre_error_msg):
-                    self.after(0, lambda msg=pre_error_msg: self.prompt_signin(url, msg))
+                if self._route_auth_failure(url, pre_error_msg):
                     return
                 # Otherwise (network/other) don't abort — fall back to a single-item
                 # download with the fresh engine, which may still succeed.
