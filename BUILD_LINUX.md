@@ -36,6 +36,12 @@ source .venv-linux/bin/activate
 pip install --upgrade pip
 pip install -r requirements.txt pyinstaller
 
+# Freeze a CURRENT yt-dlp into the build. The app auto-updates its engine at
+# runtime, but this copy is the fallback used in dev, in Flatpak, and before the
+# first update finishes -- so it should not be months old. `--pre` selects the
+# nightly channel, matching what the app downloads at runtime.
+pip install -U --pre "yt-dlp[default]"
+
 # sanity check tkinter is present in THIS interpreter:
 python -c "import tkinter, customtkinter; print('tkinter OK')"
 ```

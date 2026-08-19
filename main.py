@@ -52,9 +52,19 @@ import webbrowser
 
 class VideoDownloaderApp(ctk.CTk):
     # Version of the app - update this with each release
-    CURRENT_VERSION = "3.7.0"
+    CURRENT_VERSION = "3.8.0"
     # GitHub repository for updates
     GITHUB_REPO = "LaceEditing/laces-total-media-downloader"
+
+    # yt-dlp download engine: track the NIGHTLY channel, not stable.
+    # Sites (YouTube/TikTok/...) change things on their end constantly; extractor
+    # fixes land in nightly within hours, but only reach `stable` at the next cut,
+    # which can be 6+ weeks later. yt-dlp's own README calls stable "often stale
+    # and prone to external breakage" and recommends nightly for regular users.
+    # The nightly repo publishes identical asset names, so only the host differs.
+    YTDLP_UPDATE_REPO = "yt-dlp/yt-dlp-nightly-builds"
+    YTDLP_RELEASE_BASE = f"https://github.com/{YTDLP_UPDATE_REPO}/releases/latest/download/"
+    YTDLP_API_LATEST = f"https://api.github.com/repos/{YTDLP_UPDATE_REPO}/releases/latest"
 
     def __init__(self, CURRENT_VERSION=CURRENT_VERSION):
         super().__init__()
@@ -116,6 +126,12 @@ class VideoDownloaderApp(ctk.CTk):
 
         self._recent_display_to_path = {}  # Populated by update_recent_dropdown
         self.ytdlp_exe_path = None  # Will be set if yt-dlp.exe is downloaded
+        # Set once the engine is usable (fresh, already-current, or update failed
+        # and we're falling back). Downloads wait on this so a click during the
+        # startup update can't silently run on the stale built-in copy.
+        self._engine_ready = threading.Event()
+        # Set after a YouTube sign-in/age wall so the retry widens player_client.
+        self._widen_player_clients = False
         self.hw_encoders = {}  # Populated by _detect_hw_encoders: {'h264': enc, 'hevc': enc}
 
         # Load custom fonts
@@ -383,11 +399,84 @@ class VideoDownloaderApp(ctk.CTk):
         thread = threading.Thread(target=check, daemon=True)
         thread.start()
 
+    def _engine_dir(self):
+        """Writable per-user directory for downloaded engine binaries.
+
+        These used to be written next to the .exe, which silently fails whenever
+        the app lives somewhere unwritable (Program Files, a read-only drive, a
+        network share) — leaving it stuck forever on the stale yt-dlp copy frozen
+        into the build. A per-user data dir is always writable, and matches where
+        the app already keeps its config.
+        """
+        if sys.platform == 'win32':
+            root = os.environ.get('LOCALAPPDATA') or os.path.expanduser('~')
+            path = os.path.join(root, 'LacesTotalMediaDownloader', 'bin')
+        elif sys.platform == 'darwin':
+            path = os.path.expanduser(
+                '~/Library/Application Support/LacesTotalMediaDownloader/bin')
+        else:
+            root = os.environ.get('XDG_DATA_HOME') or os.path.expanduser('~/.local/share')
+            path = os.path.join(root, 'laces-total-media-downloader', 'bin')
+        os.makedirs(path, exist_ok=True)
+        return path
+
+    def _legacy_engine_dir(self):
+        """Where engine binaries used to live (next to the .exe / script).
+
+        Still searched read-only, so a yt-dlp/deno downloaded by an older build
+        keeps working after the move. Nothing is ever written here any more.
+        """
+        if getattr(sys, 'frozen', False):
+            return os.path.dirname(sys.executable)
+        return os.path.dirname(os.path.abspath(__file__))
+
+    def _set_engine_label(self, text):
+        """Update the header engine readout. Safe to call from any thread."""
+        def apply():
+            label = getattr(self, 'engine_label', None)
+            if label is not None:
+                try:
+                    label.configure(text=f"engine: {text}")
+                except Exception:
+                    pass
+        self.after(0, apply)
+
+    def _await_engine(self, timeout=45):
+        """Block until the startup engine update settles (or times out).
+
+        Safe to call only from a download worker thread -- never the Tk thread.
+        Without this, clicking DOWNLOAD during the startup update found
+        ytdlp_exe_path still unset and silently fell back to the yt-dlp frozen
+        into the build, producing stale-extractor errors (403s, "Unexpected
+        response from webpage request") that looked like the site's fault.
+
+        On timeout we proceed anyway rather than blocking forever -- a slow
+        download of the engine shouldn't make the app unusable.
+        """
+        if self._engine_ready.is_set():
+            return True
+        self.after(0, lambda: self.update_status(
+            "Updating download engine, one moment...", append=False))
+        ready = self._engine_ready.wait(timeout=timeout)
+        if not ready:
+            self.after(0, lambda: self.update_status(
+                "Download engine is still updating; continuing with the current one.",
+                append=False))
+        return ready
+
     def update_ytdlp(self):
-        """Automatically update yt-dlp to the latest version to prevent HTTP 403 errors"""
+        """Keep the yt-dlp download engine current, from the NIGHTLY channel.
+
+        Sites changing things on their end is what breaks downloads, and nightly
+        is where those extractor fixes land first. Running this on every launch is
+        what keeps downloads working without the user updating anything by hand.
+        """
         # Skip in sandboxed Linux environments where we can't write or pip install
         if sys.platform.startswith('linux'):
             if os.path.exists('/.flatpak-info') or os.environ.get('SNAP'):
+                # Nothing to download here, so never make downloads wait on us.
+                self._set_engine_label(self._library_version_label())
+                self._engine_ready.set()
                 return
 
         def update():
@@ -397,16 +486,13 @@ class VideoDownloaderApp(ctk.CTk):
 
                 if is_frozen:
                     # For frozen executable, download yt-dlp binary and keep it updated
-                    if hasattr(sys, '_MEIPASS'):
-                        app_dir = os.path.dirname(sys.executable)
-                    else:
-                        app_dir = os.path.dirname(os.path.abspath(__file__))
+                    engine_dir = self._engine_dir()
 
                     # Choose the right STANDALONE binary for the platform. On
                     # Linux/macOS the plain "yt-dlp" asset is a Python zipapp that
                     # needs a system Python — use the self-contained "yt-dlp_linux"
                     # / "yt-dlp_macos" builds so it works on machines without Python.
-                    base_url = 'https://github.com/yt-dlp/yt-dlp/releases/latest/download/'
+                    base_url = self.YTDLP_RELEASE_BASE
                     min_size = 1_000_000  # Expect at least ~1MB
                     if sys.platform == 'win32':
                         ytdlp_filename = 'yt-dlp.exe'
@@ -421,26 +507,51 @@ class VideoDownloaderApp(ctk.CTk):
                         ytdlp_filename = 'yt-dlp'
                         ytdlp_url = base_url + asset
 
-                    ytdlp_exe_path = os.path.join(app_dir, ytdlp_filename)
+                    ytdlp_exe_path = os.path.join(engine_dir, ytdlp_filename)
 
-                    # If we already have a usable binary, adopt it right away and
-                    # only re-download when it's actually out of date — saves the
-                    # ~30 MB download on every launch.
-                    have_local = (os.path.exists(ytdlp_exe_path)
-                                  and os.path.getsize(ytdlp_exe_path) >= min_size)
-                    if have_local:
-                        self.ytdlp_exe_path = ytdlp_exe_path
-                        installed = self._get_local_ytdlp_version(ytdlp_exe_path)
+                    # Adopt a binary we already have — new location first, then the
+                    # legacy next-to-exe spot — and open the download gate straight
+                    # away, so only a genuine first run ever has to wait.
+                    existing = None
+                    for candidate in (ytdlp_exe_path,
+                                      os.path.join(self._legacy_engine_dir(), ytdlp_filename)):
+                        try:
+                            if os.path.exists(candidate) and os.path.getsize(candidate) >= min_size:
+                                existing = candidate
+                                break
+                        except OSError:
+                            continue
+
+                    installed = None
+                    if existing:
+                        self.ytdlp_exe_path = existing
+                        self._engine_ready.set()
+                        installed = self._get_local_ytdlp_version(existing)
+
+                        # Checked on every launch, deliberately: it's one small
+                        # API call, and it's what makes "reopen the app to pick up
+                        # the fix" actually true after a site breaks something.
                         latest = self._get_latest_ytdlp_version()
-                        if installed and latest and installed == latest:
+                        if latest is None:
+                            # API unreachable or rate-limited (60 req/hr/IP for
+                            # anonymous callers). Keep what we have rather than
+                            # re-pulling ~30MB on nothing but a failed lookup.
+                            self._set_engine_label(f"{installed or 'unknown'} (check failed)")
+                            self.after(0, lambda v=installed or 'unknown': self.update_status(
+                                f"Download engine ready ({v}); update check unavailable."))
+                            return
+                        if installed and installed == latest:
+                            self._set_engine_label(installed)
                             self.after(0, lambda v=installed: self.update_status(
-                                f"yt-dlp is up to date ({v})."))
+                                f"Download engine is up to date ({v})."))
                             return
 
                     # Download to a temp file first, then rename (atomic-ish)
                     temp_path = ytdlp_exe_path + '.tmp'
                     try:
-                        response = requests.get(ytdlp_url, timeout=60)
+                        self.after(0, lambda: self.update_status(
+                            "Updating download engine (yt-dlp nightly)..."))
+                        response = requests.get(ytdlp_url, timeout=120)
                         if response.status_code == 200:
                             with open(temp_path, 'wb') as f:
                                 f.write(response.content)
@@ -458,7 +569,11 @@ class VideoDownloaderApp(ctk.CTk):
                                 os.chmod(ytdlp_exe_path, 0o755)
 
                             self.ytdlp_exe_path = ytdlp_exe_path
-                            self.after(0, lambda: self.update_status("yt-dlp updated successfully!"))
+                            new_version = self._get_local_ytdlp_version(ytdlp_exe_path)
+                            self._set_engine_label(new_version or 'updated')
+                            self.after(0, lambda v=new_version: self.update_status(
+                                f"Download engine updated ({v})!" if v
+                                else "Download engine updated!"))
                         else:
                             raise Exception(f"Download failed with status {response.status_code}")
                     finally:
@@ -469,21 +584,41 @@ class VideoDownloaderApp(ctk.CTk):
                             except Exception:
                                 pass
                 else:
-                    # For development/unfrozen, update via pip
+                    # Development/unfrozen: refresh the installed library. `--pre`
+                    # is what selects nightly on PyPI; without it pip stays on
+                    # stable, which is exactly the staleness we're avoiding.
                     python_executable = sys.executable
-                    subprocess.run(
-                        [python_executable, "-m", "pip", "install", "--upgrade", "yt-dlp[default]"],
+                    result = subprocess.run(
+                        [python_executable, "-m", "pip", "install", "-U", "--pre", "yt-dlp[default]"],
                         capture_output=True,
-                        timeout=60,
+                        text=True,
+                        timeout=180,
                         creationflags=subprocess.CREATE_NO_WINDOW if sys.platform == 'win32' else 0
                     )
+                    if result.returncode == 0:
+                        # yt_dlp is already imported, so a fresh install only takes
+                        # effect next launch — say so rather than implying otherwise.
+                        self._set_engine_label(self._library_version_label())
+                        self.after(0, lambda: self.update_status(
+                            "Download engine checked (restart to use a newer version)."))
+                    else:
+                        tail = (result.stderr or result.stdout or '').strip().splitlines()
+                        detail = tail[-1] if tail else f"pip exited {result.returncode}"
+                        self.after(0, lambda d=detail: self.update_status(
+                            f"Download engine update skipped: {d}"))
             except Exception as e:
                 # Keep using an existing local binary if we have one; only clear
                 # the path when there's nothing usable to fall back on.
                 if not (getattr(self, 'ytdlp_exe_path', None)
                         and os.path.exists(self.ytdlp_exe_path)):
                     self.ytdlp_exe_path = None
-                self.after(0, lambda: self.update_status(f"yt-dlp update failed: {e}"))
+                self._set_engine_label(
+                    (self._get_local_ytdlp_version(self.ytdlp_exe_path) or 'unknown')
+                    if self._have_ytdlp_exe() else self._library_version_label())
+                self.after(0, lambda: self.update_status(f"Download engine update failed: {e}"))
+            finally:
+                # Whatever happened, never leave a download blocked waiting on us.
+                self._engine_ready.set()
 
         # Run update in background thread so it doesn't block UI
         thread = threading.Thread(target=update, daemon=True)
@@ -502,22 +637,35 @@ class VideoDownloaderApp(ctk.CTk):
         return None
 
     def _get_latest_ytdlp_version(self):
-        """Return the latest yt-dlp release tag from GitHub, or None."""
+        """Return the latest yt-dlp nightly release tag from GitHub, or None."""
         try:
-            response = requests.get(
-                "https://api.github.com/repos/yt-dlp/yt-dlp/releases/latest", timeout=10)
+            response = requests.get(self.YTDLP_API_LATEST, timeout=10)
             if response.status_code == 200:
                 return response.json().get('tag_name', '').strip() or None
         except Exception:
             pass
         return None
 
+    @staticmethod
+    def _library_version_label():
+        """Version of the yt-dlp frozen into this build, as a bare string."""
+        try:
+            return f"{yt_dlp.version.__version__} (built in)"
+        except Exception:
+            return "built in"
+
+    def engine_version_label(self):
+        """Short description of which engine is in use, for status/error text."""
+        if self._have_ytdlp_exe():
+            version_str = self._get_local_ytdlp_version(self.ytdlp_exe_path) or 'unknown'
+            return f"yt-dlp {version_str} (auto-updating)"
+        return f"yt-dlp {self._library_version_label()}"
     def run_ytdlp_download(self, ydl_opts, url):
         """Run yt-dlp download using either external exe or bundled library"""
         is_frozen = getattr(sys, 'frozen', False)
 
         # If frozen and we have an external yt-dlp.exe, use it via subprocess
-        if is_frozen and hasattr(self, 'ytdlp_exe_path') and self.ytdlp_exe_path and os.path.exists(self.ytdlp_exe_path):
+        if is_frozen and self._have_ytdlp_exe():
             return self._run_ytdlp_subprocess(ydl_opts, url)
         else:
             # Use bundled library
@@ -536,8 +684,18 @@ class VideoDownloaderApp(ctk.CTk):
             result = ydl.extract_info(url, download=True)
             return result
 
-    def _run_ytdlp_subprocess(self, ydl_opts, url):
-        """Run yt-dlp using external executable via subprocess"""
+    def _build_ytdlp_argv(self, ydl_opts):
+        """Translate a ydl_opts dict into CLI args for the external yt-dlp binary.
+
+        Shared by the real download and the pre-scan probe so both run through the
+        same engine with the same cookies/extractor/JS-runtime settings — if these
+        two ever disagree, a URL can pre-scan fine and then fail to download (or
+        the reverse). Returns argv without the URL or any progress flags; callers
+        append what they need.
+
+        Note this translation is deliberately partial: only the options below are
+        forwarded, so anything else in ydl_opts is ignored on this path.
+        """
         # Build command line arguments from ydl_opts
         cmd = [self.ytdlp_exe_path]
 
@@ -601,6 +759,42 @@ class VideoDownloaderApp(ctk.CTk):
         # Add noplaylist option
         if ydl_opts.get('noplaylist'):
             cmd.append('--no-playlist')
+
+        return cmd
+
+    def _have_ytdlp_exe(self):
+        """True if the auto-updated external engine is available to run."""
+        exe = getattr(self, 'ytdlp_exe_path', None)
+        return bool(exe) and os.path.exists(exe)
+
+    def _probe_with_exe(self, ydl_opts, url):
+        """Pre-scan a URL with the external (auto-updated) engine.
+
+        The probe used to always run through the yt-dlp library frozen into the
+        build, so extraction ran on months-old code even when a fresh binary was
+        sitting right there. Extraction is exactly what breaks when a site changes
+        its pages, so the probe has to use the current engine too.
+
+        Returns a dict shaped like extract_info(download=False) -- 'entries'
+        present means a playlist -- or raises so the caller's existing error
+        handling (sign-in routing, fallback) still applies.
+        """
+        cmd = self._build_ytdlp_argv(ydl_opts)
+        cmd.extend(['-J', '--flat-playlist', '--no-warnings', url])
+
+        creationflags = subprocess.CREATE_NO_WINDOW if sys.platform == 'win32' else 0
+        result = subprocess.run(cmd, capture_output=True, text=True,
+                                timeout=120, creationflags=creationflags)
+        if result.returncode != 0:
+            detail = (result.stderr or '').strip().splitlines()
+            detail = [ln for ln in detail if ln.lower().startswith(('error:', 'warning:'))]
+            raise Exception("\n".join(detail[-5:]).strip()
+                            or f"yt-dlp probe failed with return code {result.returncode}")
+        return json.loads(result.stdout)
+
+    def _run_ytdlp_subprocess(self, ydl_opts, url):
+        """Run yt-dlp using external executable via subprocess"""
+        cmd = self._build_ytdlp_argv(ydl_opts)
 
         # Add progress reporting
         cmd.append('--newline')
@@ -1071,25 +1265,39 @@ class VideoDownloaderApp(ctk.CTk):
             elif src and src not in ('none', 'file'):
                 ydl_opts['cookiesfrombrowser'] = (src,)
 
-        # Extra YouTube clients help with some age gates / bot checks even
-        # without cookies; 'default' keeps the normal clients available too.
-        extractor_args = ydl_opts.setdefault('extractor_args', {})
-        yt_args = extractor_args.setdefault('youtube', {})
-        yt_args['player_client'] = ['default', 'tv']
+        # Deliberately DON'T pin player_client on the first attempt. yt-dlp
+        # maintains that list against YouTube's changes, so hardcoding it here
+        # overrides the very fix a freshly-updated engine is shipping -- a way to
+        # keep getting 403s on an otherwise current engine. The extra 'tv' client
+        # still helps with age gates, so it goes on the retry after a sign-in
+        # wall, where we already know a plain attempt didn't work.
+        if getattr(self, '_widen_player_clients', False) and self._is_youtube_url(url):
+            extractor_args = ydl_opts.setdefault('extractor_args', {})
+            yt_args = extractor_args.setdefault('youtube', {})
+            yt_args['player_client'] = ['default', 'tv']
         self._apply_js_runtime_opts(ydl_opts)
         return ydl_opts
 
     def _get_bundled_base_paths(self):
         """Directories to search for bundled binaries (ffmpeg, deno, etc.)."""
         paths = []
+        # Anything we downloaded ourselves lives here (writable on every install
+        # location), so look here first.
+        try:
+            paths.append(self._engine_dir())
+        except Exception:
+            pass
         if getattr(sys, 'frozen', False):
             # PyInstaller onefile self-extracts bundled binaries to _MEIPASS;
-            # also check the folder the .exe itself lives in.
+            # also check the folder the .exe itself lives in -- older builds
+            # downloaded deno/yt-dlp there, and those should keep working.
             paths.append(sys._MEIPASS)
             paths.append(os.path.dirname(sys.executable))
         else:
             paths.append(os.path.dirname(os.path.abspath(__file__)))
-        return paths
+        # De-dupe while preserving order (the dirs can coincide in dev runs).
+        seen = set()
+        return [p for p in paths if p and not (p in seen or seen.add(p))]
 
     def _find_bundled_executable(self, names):
         """Return the path to a bundled binary matching any of `names`, if present."""
@@ -1150,10 +1358,12 @@ class VideoDownloaderApp(ctk.CTk):
         ydl_opts.setdefault('remote_components', ['ejs:github'])
 
     def _runtime_download_dir(self):
-        """Folder to drop an auto-downloaded deno into (next to the .exe / script)."""
-        if getattr(sys, 'frozen', False):
-            return os.path.dirname(sys.executable)
-        return os.path.dirname(os.path.abspath(__file__))
+        """Folder to drop an auto-downloaded deno into.
+
+        Same per-user location as the yt-dlp engine, so it still works when the
+        app is installed somewhere unwritable.
+        """
+        return self._engine_dir()
 
     @staticmethod
     def _deno_download_url():
@@ -1285,6 +1495,17 @@ class VideoDownloaderApp(ctk.CTk):
             corner_radius=25
         )
         self.check_updates_btn.pack(side="right", padx=(0, 10))
+
+        # Which download engine is actually running. Site breakage is the most
+        # common failure, and "how old is my engine?" is the first thing worth
+        # knowing when it happens -- so keep the answer on screen.
+        self.engine_label = ctk.CTkLabel(
+            self.header_frame,
+            text="engine: checking…",
+            font=ctk.CTkFont(size=11),
+            text_color=self.colors['purple']
+        )
+        self.engine_label.pack(side="right", padx=(0, 10))
 
         # Default font for the rest of the UI
         if self.has_bartino:
@@ -1846,6 +2067,8 @@ class VideoDownloaderApp(ctk.CTk):
             return True
 
         if self._is_auth_error(error_msg):
+            # A plain attempt hit a wall, so let the retry try extra clients too.
+            self._widen_player_clients = True
             self.after(0, lambda msg=error_msg: self.prompt_signin(url, msg))
             return True
         return False
@@ -2254,6 +2477,40 @@ class VideoDownloaderApp(ctk.CTk):
         # Show completion dialog
         self.after(100, self.show_completion_dialog)
 
+    # Signs that a site changed its pages and the extractor hasn't caught up.
+    # These are the errors a fresh engine fixes, so they get the same advice.
+    _SITE_BREAKAGE_MARKERS = (
+        'unexpected response from webpage request',
+        'unable to extract',
+        'failed to parse json',
+        'unable to download webpage',
+    )
+
+    def _is_site_breakage_error(self, error_msg):
+        """True if this reads like an extractor that a site update has outrun."""
+        low = error_msg.lower()
+        return any(marker in low for marker in self._SITE_BREAKAGE_MARKERS)
+
+    @staticmethod
+    def _is_http_403_error(error_msg):
+        """True for a real HTTP 403, not any message that merely contains '403'.
+
+        The old bare `"403" in error_msg` test also fired on unrelated text --
+        including a message an earlier branch had already rewritten -- and on any
+        video id or byte count that happened to contain those digits.
+        """
+        low = error_msg.lower()
+        return 'http error 403' in low or '403: forbidden' in low
+
+    def _engine_advice(self):
+        """Explain the engine situation in terms the user can act on."""
+        return (
+            f"Engine in use: {self.engine_version_label()}.\n"
+            "The app updates this engine from yt-dlp's nightly channel every time "
+            "it starts, so the usual fix is to reopen the app in a day or two, "
+            "once a fix has shipped. Updating the app itself won't change this."
+        )
+
     def _handle_download_error(self, e, url=None):
         """Format and display a download error. Must be called from a worker thread."""
         error_msg = str(e)
@@ -2264,12 +2521,14 @@ class VideoDownloaderApp(ctk.CTk):
             self.after(0, lambda: self.progress_bar.set(0))
             return
 
+        handled = False
+
         if self._is_js_challenge_error(error_msg):
             runtime_args = self._get_js_runtime_args()
             if runtime_args:
                 runtime_note = (
                     "A JavaScript runtime was detected and will be used automatically. "
-                    "If this keeps happening, restart the app so yt-dlp can finish updating."
+                    "If this keeps happening, restart the app so the engine can finish updating."
                 )
             else:
                 runtime_note = (
@@ -2283,30 +2542,41 @@ class VideoDownloaderApp(ctk.CTk):
                 f"{runtime_note}\n\n"
                 f"Technical details: {error_msg}"
             )
+            handled = True
 
-        # Check for HTTP 403 errors (common when yt-dlp is outdated)
-        if "403" in error_msg or "Forbidden" in error_msg:
-            is_frozen = getattr(sys, 'frozen', False)
-            if is_frozen:
-                error_msg = (
-                    "HTTP 403 Error: YouTube has changed something!\n\n"
-                    "Please check for app updates (you should see an update notification if available).\n"
-                    "If no update is available, please report this issue!\n\n"
-                    f"Technical details: {error_msg}"
-                )
-            else:
-                error_msg = (
-                    "HTTP 403 Error: YouTube has changed something!\n\n"
-                    "yt-dlp is updating in the background. Please try again in a moment.\n"
-                    "If the issue persists, restart the application.\n\n"
-                    f"Technical details: {error_msg}"
-                )
+        # A real 403 almost always means the engine is behind what the site now
+        # serves. Point at the engine, not at an app update -- an app release does
+        # nothing for this unless one happens to be cut.
+        elif self._is_http_403_error(error_msg):
+            error_msg = (
+                "HTTP 403: the site refused the download.\n\n"
+                "This usually means the site changed how it serves video and the "
+                "download engine hasn't caught up yet.\n\n"
+                f"{self._engine_advice()}\n\n"
+                f"Technical details: {error_msg}"
+            )
+            handled = True
+
+        # Same root cause, different symptom -- and not necessarily YouTube, so
+        # this must not blame it the way the old message did unconditionally.
+        elif self._is_site_breakage_error(error_msg):
+            error_msg = (
+                "This site changed something and the download engine couldn't read "
+                "the page.\n\n"
+                f"{self._engine_advice()}\n\n"
+                f"Technical details: {error_msg}"
+            )
+            handled = True
+
+        if not handled:
+            error_msg = f"{error_msg}\n\n(Engine in use: {self.engine_version_label()}.)"
 
         self.after(0, lambda: self.update_status(f"Error: {error_msg}"))
         self.after(0, lambda: self.progress_bar.set(0))
 
     def download_media(self, url):
         try:
+            self._await_engine()
             self.after(0, lambda: self.update_status(f"Peeping that URL: {url}", append=False))
 
             # Pre-scan: detect playlists and (for single videos) the max available
@@ -2322,9 +2592,15 @@ class VideoDownloaderApp(ctk.CTk):
             info = None
             is_playlist = False
             try:
-                with yt_dlp.YoutubeDL(ydl_opts_check) as ydl:
-                    info = ydl.extract_info(url, download=False)
-                    is_playlist = bool(info) and 'entries' in info
+                # Prefer the auto-updated engine: extraction is the part that
+                # breaks when a site changes, so probing with the frozen-in
+                # library would reintroduce the staleness we just fixed.
+                if getattr(sys, 'frozen', False) and self._have_ytdlp_exe():
+                    info = self._probe_with_exe(ydl_opts_check, url)
+                else:
+                    with yt_dlp.YoutubeDL(ydl_opts_check) as ydl:
+                        info = ydl.extract_info(url, download=False)
+                is_playlist = bool(info) and 'entries' in info
             except Exception as pre_e:
                 pre_error_msg = str(pre_e)
                 # If this looks like a sign-in wall, offer the sign-in popup
@@ -2518,6 +2794,9 @@ class VideoDownloaderApp(ctk.CTk):
         self.is_downloading = True
         self.download_btn.configure(state="disabled", text="Downloading...")
         self.progress_bar.set(0)
+        # Fresh attempt: go back to yt-dlp's own default clients. Only the
+        # sign-in retry widens them (see _apply_auth_opts).
+        self._widen_player_clients = False
 
         # Start download in separate thread
         thread = threading.Thread(target=self.download_media, args=(url,), daemon=True)

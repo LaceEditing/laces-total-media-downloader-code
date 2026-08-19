@@ -52,8 +52,8 @@ modules:
     build-commands:
       - pip3 install --no-build-isolation --prefix=/app
           customtkinter
-          yt-dlp
-          pygame
+          'yt-dlp[default]'
+          pygame-ce
           requests
           packaging
           Pillow

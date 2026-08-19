@@ -72,6 +72,9 @@ def make_app():
     app = object.__new__(VideoDownloaderApp)
     app.cookies_source = 'none'
     app.cookies_file = ''
+    # Only the sign-in retry widens YouTube's player_client; a fresh attempt
+    # leaves that list to yt-dlp itself.
+    app._widen_player_clients = False
     return app
 
 

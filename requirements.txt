@@ -1,6 +1,9 @@
 customtkinter>=5.2.0
 yt-dlp[default]
-pygame>=2.5.0
+# pygame-ce is the maintained community fork; it installs AS the `pygame` module,
+# so every `import pygame` keeps working. Upstream pygame lags new Python releases
+# (no cp314 wheel as of 3.14), which blocks the build outright.
+pygame-ce>=2.5.0
 requests>=2.31.0
 packaging>=23.0
 Pillow>=10.0.0

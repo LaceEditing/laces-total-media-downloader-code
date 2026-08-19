@@ -50,6 +50,12 @@ datas = [('assets', 'assets')]
 datas += collect_data_files('customtkinter')
 datas += collect_data_files('yt_dlp_ejs')
 
+# NOTE: whatever yt-dlp is in the build venv gets frozen in permanently. The app
+# auto-updates its engine from the nightly channel at runtime, but this copy is
+# still the fallback (dev runs, Flatpak, and the moments before the first update
+# lands), so refresh it right before building:
+#     pip install -U --pre "yt-dlp[default]"
+
 a = Analysis(
     ['main.py'],
     pathex=[],
@@ -57,6 +63,8 @@ a = Analysis(
     datas=datas,
     hiddenimports=[
         'customtkinter',
+        # NB: these stay 'pygame' even though requirements.txt installs pygame-ce
+        # -- the fork provides the `pygame` module, so the import names are right.
         'pygame',
         'pygame.mixer',
         'requests',
