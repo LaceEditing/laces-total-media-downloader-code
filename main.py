@@ -1,5 +1,6 @@
 ﻿import os
 import sys
+import glob
 import shutil
 import subprocess
 
@@ -26,6 +27,19 @@ if sys.platform.startswith('linux'):
 
 import customtkinter as ctk
 
+if sys.platform.startswith('linux'):
+    # CustomTkinter draws rounded corners, radio buttons and checkmarks by
+    # stamping glyphs from its own shapes font onto a canvas. Through Xft those
+    # glyphs land at a slightly different size than the rectangle they're meant
+    # to cap, so the pieces never join up: the selected radio button came out as
+    # a filled SQUARE with a hole punched in it, and the unselected one as four
+    # loose corner arcs with no ring at all.
+    #
+    # 'polygon_shapes' draws the same shapes as real canvas polygons instead of
+    # font glyphs. It is what CustomTkinter already uses on macOS, it has no
+    # font dependency at all, and it renders identically at every size.
+    ctk.DrawEngine.preferred_drawing_method = "polygon_shapes"
+
 # Rebuild fontconfig cache AFTER CTk copied its fonts to ~/.fonts but
 # BEFORE any Tk root window is created (that happens in ctk.CTk.__init__).
 if sys.platform.startswith('linux'):
@@ -51,6 +65,26 @@ import webbrowser
 
 
 class VideoDownloaderApp(ctk.CTk):
+    # The refresh button's glyph. U+1F504 is a colour-emoji codepoint, and on
+    # Linux the only font carrying it is typically Noto Color Emoji -- a colour
+    # bitmap font that older X font stacks can't draw, which left the button
+    # visibly empty. U+21BB is a plain monochrome arrow that DejaVu carries, and
+    # DejaVu is the fallback family on essentially every Linux desktop.
+    REFRESH_GLYPH = "\u21bb" if sys.platform.startswith('linux') else "\U0001F504"
+
+    # Tk's className becomes the X11 WM_CLASS. Tk rewrites it into two fields --
+    # instance (first letter lowercased) and class (first letter upper, rest
+    # lowercased) -- so an internally-capitalised name comes back out mangled as
+    # "Lacestotalmediadownloader". An all-lowercase name survives that intact and
+    # gives a WM_CLASS install-linux.sh can match on exactly.
+    WM_CLASS_NAME = "laces-total-media-downloader"
+
+    # Launch size on Linux. Measured on X11/fontconfig, where this layout needs
+    # far more room than the 950x700 the Windows build opens at -- at that size
+    # the title, the engine readout and the whole Output Folder row were cropped.
+    # Treated as a floor, so a system whose fonts run wider still gets fitted up.
+    LINUX_WINDOW_SIZE = (1430, 1063)
+
     # Version of the app - update this with each release
     CURRENT_VERSION = "3.8.0"
     # GitHub repository for updates
@@ -67,7 +101,12 @@ class VideoDownloaderApp(ctk.CTk):
     YTDLP_API_LATEST = f"https://api.github.com/repos/{YTDLP_UPDATE_REPO}/releases/latest"
 
     def __init__(self, CURRENT_VERSION=CURRENT_VERSION):
-        super().__init__()
+        # X11 identifies a window by WM_CLASS, and that is what a desktop
+        # environment matches against a .desktop file's StartupWMClass to give
+        # the window its name and icon in the taskbar. Tk defaults it to "Tk",
+        # so the app showed up as a generic Tk window with a feather icon.
+        super().__init__(**({'className': self.WM_CLASS_NAME}
+                            if sys.platform.startswith('linux') else {}))
 
         # Window setup
         self.title(f"Hey besties let's download those files! (v{CURRENT_VERSION})")
@@ -139,6 +178,11 @@ class VideoDownloaderApp(ctk.CTk):
 
         self.setup_ui()
 
+        # X11 lays this layout out wider than Windows does, so the fixed
+        # 950x700 above cropped the title and the whole Output Folder row.
+        if sys.platform.startswith('linux'):
+            self.after_idle(self._fit_window_to_content)
+
         # Show ffmpeg warning if not available
         if not self.ffmpeg_available:
             self.after(500, self.show_ffmpeg_warning)
@@ -156,6 +200,46 @@ class VideoDownloaderApp(ctk.CTk):
 
         # Check for updates on startup
         self.after(1000, self.check_for_updates)
+
+    @staticmethod
+    def _fit_to_content(window, min_w, min_h):
+        """Grow `window` to whatever its layout actually asks for.
+
+        Every hardcoded size in this app was measured against Windows font
+        metrics; through fontconfig/Xft the same widgets come out wider, so on
+        Linux those sizes crop their own content. Only ever grows, and never
+        past what the screen can show.
+        """
+        try:
+            window.update_idletasks()
+            need_w, need_h = window.winfo_reqwidth(), window.winfo_reqheight()
+            max_w = max(window.winfo_screenwidth() - 80, min_w)
+            max_h = max(window.winfo_screenheight() - 120, min_h)
+            width = min(max(need_w, min_w), max_w)
+            height = min(max(need_h, min_h), max_h)
+            window.geometry(f"{width}x{height}")
+            return need_w, need_h, max_w, max_h
+        except Exception:
+            return None
+
+    def _fit_window_to_content(self):
+        """Grow the main window until the layout actually fits (Linux only).
+
+        LINUX_WINDOW_SIZE is the floor; anything the layout asks for beyond that
+        (wider system fonts, a larger UI scale) grows the window instead of being
+        cropped.
+
+        Width is the part that matters: the option rows are packed side-by-side
+        and never reflow, so anything narrower than the requested width is lost
+        for good. Height is safe to leave flexible because the progress frame and
+        the status log both expand, and absorb whatever is left over.
+        """
+        fitted = self._fit_to_content(self, *self.LINUX_WINDOW_SIZE)
+        if fitted:
+            need_w, _need_h, max_w, max_h = fitted
+            # Raise the width floor too, so the window can't be dragged back
+            # down into a crop. Height keeps its old floor.
+            self.minsize(min(max(need_w, 850), max_w), min(700, max_h))
 
     def destroy(self):
         """Clean up resources before closing."""
@@ -298,6 +382,35 @@ class VideoDownloaderApp(ctk.CTk):
             self.has_bubblegum = False
             self.has_bartino = False
 
+    @staticmethod
+    def _platform_release_asset(assets):
+        """URL of the release asset built for THIS platform, or None.
+
+        Matching on ".exe" alone offered Linux users the Windows build and then
+        told them to run it. Each platform now only ever accepts its own
+        artifact, and "no asset for this platform" is a normal outcome (a
+        release may ship Windows only) rather than a wrong download.
+
+        The Linux artifact is matched by name, so the spec deliberately builds
+        it as LacesTotalMediaDownloader_v<VERSION>_linux (see BUILD_LINUX.md).
+        """
+        if sys.platform == 'win32':
+            def matches(name):
+                return name.endswith('.exe')
+        elif sys.platform == 'darwin':
+            def matches(name):
+                return name.endswith(('.dmg', '.pkg')) or 'macos' in name
+        else:
+            def matches(name):
+                if name.endswith(('.exe', '.dmg', '.pkg', '.msi', '.flatpak')):
+                    return False
+                return 'linux' in name or name.endswith('.appimage')
+
+        for asset in assets:
+            if matches((asset.get('name') or '').lower()):
+                return asset.get('browser_download_url')
+        return None
+
     def check_for_updates(self):
         """Check for updates from GitHub releases"""
         # Skip auto-update on Linux (especially in Flatpak/Snap)
@@ -320,11 +433,7 @@ class VideoDownloaderApp(ctk.CTk):
                     # Compare versions
                     if version.parse(latest_version) > version.parse(self.CURRENT_VERSION):
                         # Found newer version
-                        download_url = None
-                        for asset in data.get('assets', []):
-                            if asset['name'].endswith('.exe'):
-                                download_url = asset['browser_download_url']
-                                break
+                        download_url = self._platform_release_asset(data.get('assets', []))
 
                         if download_url:
                             self.after(0, lambda: self.show_update_dialog(latest_version, download_url,
@@ -356,11 +465,7 @@ class VideoDownloaderApp(ctk.CTk):
                     # Compare versions
                     if version.parse(latest_version) > version.parse(self.CURRENT_VERSION):
                         # Found newer version
-                        download_url = None
-                        for asset in data.get('assets', []):
-                            if asset['name'].endswith('.exe'):
-                                download_url = asset['browser_download_url']
-                                break
+                        download_url = self._platform_release_asset(data.get('assets', []))
 
                         if download_url:
                             self.after(0, lambda: self.show_update_dialog(latest_version, download_url,
@@ -368,7 +473,8 @@ class VideoDownloaderApp(ctk.CTk):
                         else:
                             self.after(0, lambda: messagebox.showinfo(
                                 "No Update Available",
-                                f"No downloadable update found for version {latest_version}."
+                                f"Version {latest_version} is out, but it has no build for "
+                                f"{'Windows' if sys.platform == 'win32' else 'macOS' if sys.platform == 'darwin' else 'Linux'} yet."
                             ))
                     else:
                         # Already on latest version
@@ -713,7 +819,11 @@ class VideoDownloaderApp(ctk.CTk):
 
         # Add cookies (browser login or cookies.txt) for age/bot/members-gated videos
         if 'cookiesfrombrowser' in ydl_opts:
-            cmd.extend(['--cookies-from-browser', ydl_opts['cookiesfrombrowser'][0]])
+            spec = ydl_opts['cookiesfrombrowser']
+            # BROWSER[:PROFILE] -- keep the profile, or the binary path and the
+            # library path would disagree about which browser they're reading.
+            browser_arg = f'{spec[0]}:{spec[1]}' if len(spec) > 1 and spec[1] else spec[0]
+            cmd.extend(['--cookies-from-browser', browser_arg])
         if 'cookiefile' in ydl_opts:
             cmd.extend(['--cookies', ydl_opts['cookiefile']])
 
@@ -924,10 +1034,19 @@ class VideoDownloaderApp(ctk.CTk):
                     current_exe = os.path.abspath(__file__)
 
                 current_dir = os.path.dirname(current_exe)
-                final_path = os.path.join(current_dir, 'LacesTotalMediaDownloader_new.exe')
+                # The Linux build is an extensionless ELF, so the ".exe" here was
+                # producing a file the user could neither run nor recognise.
+                suffix = '.exe' if sys.platform == 'win32' else ''
+                # A Linux install can easily sit somewhere unwritable (/opt,
+                # /usr/local/bin). Windows keeps the old behaviour because its
+                # installer script rewrites current_exe in place regardless.
+                if sys.platform != 'win32' and not os.access(current_dir, os.W_OK):
+                    current_dir = str(Path.home() / 'Downloads')
+                    os.makedirs(current_dir, exist_ok=True)
+                final_path = os.path.join(current_dir, f'LacesTotalMediaDownloader_new{suffix}')
 
                 # Download to a temp file first, then rename on success
-                temp_fd, temp_path = tempfile.mkstemp(suffix='.exe.tmp', dir=current_dir)
+                temp_fd, temp_path = tempfile.mkstemp(suffix=suffix + '.tmp', dir=current_dir)
                 os.close(temp_fd)
                 temp_fd = None
 
@@ -1001,9 +1120,18 @@ class VideoDownloaderApp(ctk.CTk):
 
                     self.after(100, self.destroy)
                 else:
+                    # Downloaded files aren't executable by default on Linux/macOS,
+                    # so the "just run it" instruction below needs this first.
+                    try:
+                        os.chmod(final_path, 0o755)
+                    except OSError:
+                        pass
                     self.after(0, lambda: messagebox.showinfo(
                         "Update Downloaded",
-                        f"Update downloaded to:\n{final_path}\n\nPlease manually replace the current executable and restart."
+                        f"Update downloaded to:\n{final_path}\n\n"
+                        f"Close this app, then replace the current file:\n"
+                        f"  mv '{final_path}' '{current_exe}'\n\n"
+                        f"and start it again."
                     ))
 
             except Exception as e:
@@ -1248,10 +1376,10 @@ class VideoDownloaderApp(ctk.CTk):
 
         Cookies are only attached once the user has actually signed in through
         prompt_signin(). Reaching for the default browser's cookies on every
-        YouTube URL used to break *every* download instead of helping: Chromium
-        browsers (Chrome/Edge/Brave) keep their cookie database locked while
-        they're running, and yt-dlp treats that as a fatal error, so nothing
-        downloaded until the user closed their browser. Most videos need no
+        YouTube URL used to break *every* download instead of helping: on Windows
+        Chromium browsers (Chrome/Edge/Brave) keep their cookie database locked
+        while they're running, and yt-dlp treats that as a fatal error, so
+        nothing downloaded until the user closed their browser. Most videos need no
         cookies at all, so the first attempt is always made without them.
         """
         src = self.cookies_source
@@ -1263,7 +1391,11 @@ class VideoDownloaderApp(ctk.CTk):
             if src == 'file' and self.cookies_file and os.path.exists(self.cookies_file):
                 ydl_opts['cookiefile'] = self.cookies_file
             elif src and src not in ('none', 'file'):
-                ydl_opts['cookiesfrombrowser'] = (src,)
+                # Second element is yt-dlp's `profile`, which accepts an absolute
+                # directory. Sending the one we detected is what makes a Flatpak
+                # or Snap browser work at all.
+                profile = self._browser_profile_dir(src)
+                ydl_opts['cookiesfrombrowser'] = (src, profile) if profile else (src,)
 
         # Deliberately DON'T pin player_client on the first attempt. yt-dlp
         # maintains that list against YouTube's changes, so hardcoding it here
@@ -1368,14 +1500,14 @@ class VideoDownloaderApp(ctk.CTk):
     @staticmethod
     def _deno_download_url():
         """Latest-release Deno asset URL for this platform (zip archive)."""
+        import platform
         base = 'https://github.com/denoland/deno/releases/latest/download/'
+        arch = 'aarch64' if platform.machine().lower() in ('arm64', 'aarch64') else 'x86_64'
         if sys.platform == 'win32':
             return base + 'deno-x86_64-pc-windows-msvc.zip'
         if sys.platform == 'darwin':
-            import platform
-            arch = 'aarch64' if platform.machine().lower() in ('arm64', 'aarch64') else 'x86_64'
             return base + f'deno-{arch}-apple-darwin.zip'
-        return base + 'deno-x86_64-unknown-linux-gnu.zip'
+        return base + f'deno-{arch}-unknown-linux-gnu.zip'
 
     def ensure_js_runtime(self):
         """Make sure a JavaScript runtime is available for YouTube's n-challenge.
@@ -1480,12 +1612,14 @@ class VideoDownloaderApp(ctk.CTk):
             font=title_font,
             text_color=self.colors['purple']
         )
-        self.title_label.pack(side="left", expand=True)
+        # NB: packed further down, AFTER the two right-hand items. Pack hands out
+        # space in call order, so a title packed first claimed its full natural
+        # width and left the engine readout to render as "ne: 2026.08.30...".
 
         # Check for Updates button
         self.check_updates_btn = ctk.CTkButton(
             self.header_frame,
-            text="🔄",
+            text=self.REFRESH_GLYPH,
             command=self.manual_check_for_updates,
             width=50,
             height=50,
@@ -1506,6 +1640,9 @@ class VideoDownloaderApp(ctk.CTk):
             text_color=self.colors['purple']
         )
         self.engine_label.pack(side="right", padx=(0, 10))
+
+        # Now the title takes whatever is left, and stays centred in it.
+        self.title_label.pack(side="left", expand=True)
 
         # Default font for the rest of the UI
         if self.has_bartino:
@@ -1861,22 +1998,73 @@ class VideoDownloaderApp(ctk.CTk):
                 'vivaldi': [os.path.join(support, 'Vivaldi')],
                 'safari': [os.path.join(home, 'Library', 'Cookies')],
             }
-        # Linux (including the flatpak sandbox's view of the host dirs)
+        # Linux. Flatpak and Snap browsers keep their profile inside their own
+        # sandbox dir instead of ~/.config, and only Firefox and Brave were
+        # listed that way -- so a Flatpak Chrome or Chromium (the normal way to
+        # install them on an immutable or Arch-based distro) was invisible here.
         cfg = os.environ.get('XDG_CONFIG_HOME', os.path.join(home, '.config'))
+
+        def flatpak(app_id, *parts):
+            return os.path.join(home, '.var', 'app', app_id, *parts)
+
         return {
             'firefox': [os.path.join(home, '.mozilla', 'firefox'),
                         os.path.join(home, 'snap', 'firefox', 'common', '.mozilla', 'firefox'),
-                        os.path.join(home, '.var', 'app', 'org.mozilla.firefox', '.mozilla', 'firefox')],
-            'chrome': [os.path.join(cfg, 'google-chrome')],
-            'edge': [os.path.join(cfg, 'microsoft-edge')],
+                        flatpak('org.mozilla.firefox', '.mozilla', 'firefox')],
+            'chrome': [os.path.join(cfg, 'google-chrome'),
+                       flatpak('com.google.Chrome', 'config', 'google-chrome')],
+            'edge': [os.path.join(cfg, 'microsoft-edge'),
+                     flatpak('com.microsoft.Edge', 'config', 'microsoft-edge')],
             'brave': [os.path.join(cfg, 'BraveSoftware', 'Brave-Browser'),
-                      os.path.join(home, '.var', 'app', 'com.brave.Browser', 'config',
-                                   'BraveSoftware', 'Brave-Browser')],
+                      flatpak('com.brave.Browser', 'config',
+                              'BraveSoftware', 'Brave-Browser')],
             'chromium': [os.path.join(cfg, 'chromium'),
-                         os.path.join(home, 'snap', 'chromium', 'common', 'chromium')],
-            'opera': [os.path.join(cfg, 'opera')],
-            'vivaldi': [os.path.join(cfg, 'vivaldi')],
+                         os.path.join(home, 'snap', 'chromium', 'common', 'chromium'),
+                         flatpak('org.chromium.Chromium', 'config', 'chromium'),
+                         flatpak('io.github.ungoogled_software.ungoogled_chromium',
+                                 'config', 'chromium')],
+            'opera': [os.path.join(cfg, 'opera'),
+                      flatpak('com.opera.Opera', 'config', 'opera')],
+            'vivaldi': [os.path.join(cfg, 'vivaldi'),
+                        flatpak('com.vivaldi.Vivaldi', 'config', 'vivaldi')],
         }
+
+    # Where the cookie store actually sits inside a profile directory. Globbed,
+    # because the profile is named (Default, "Profile 1", "xxxx.default-release")
+    # and Chrome moved its file down into Network/ a few versions back.
+    COOKIE_DB_GLOBS = {
+        'firefox': ('*/cookies.sqlite', 'Profiles/*/cookies.sqlite'),
+        'safari': ('Cookies.binarycookies',),
+        '_chromium': ('*/Cookies', '*/Network/Cookies'),
+    }
+
+    @classmethod
+    def _has_cookie_db(cls, browser, directory):
+        """True if `directory` actually holds a cookie database.
+
+        The directory merely existing is not enough. Uninstalling a browser
+        leaves its profile folder behind -- and KDE's browser integration
+        recreates one containing nothing but NativeMessagingHosts -- so a
+        presence check alone offers browsers whose cookie store is long gone,
+        turning a working sign-in into a download-time failure.
+        """
+        patterns = cls.COOKIE_DB_GLOBS.get(
+            browser, cls.COOKIE_DB_GLOBS['_chromium'])
+        return any(glob.glob(os.path.join(directory, pattern))
+                   for pattern in patterns)
+
+    def _browser_profile_dir(self, browser):
+        """The profile directory holding `browser`'s cookies, or None.
+
+        yt-dlp only ever checks a browser's native location, so this is what
+        gets handed to it for the sandboxed installs above -- otherwise the
+        picker offers a browser that then fails with "could not find
+        <browser> cookies database".
+        """
+        for directory in self._browser_profile_dirs().get(browser, ()):
+            if os.path.isdir(directory) and self._has_cookie_db(browser, directory):
+                return directory
+        return None
 
     def _available_browsers(self):
         """Installed browsers yt-dlp can read cookies from, best choice first.
@@ -1884,8 +2072,8 @@ class VideoDownloaderApp(ctk.CTk):
         Firefox leads because it is the only browser whose cookies stay
         readable on Windows while it's running.
         """
-        found = [name for name, dirs in self._browser_profile_dirs().items()
-                 if any(os.path.isdir(d) for d in dirs)]
+        found = [name for name in self._browser_profile_dirs()
+                 if self._browser_profile_dir(name)]
         default = self._get_default_browser()
         order = {'firefox': 0}
         found.sort(key=lambda n: (order.get(n, 1), n != default, n))
@@ -1926,17 +2114,37 @@ class VideoDownloaderApp(ctk.CTk):
                 return path
         return None
 
+    def _flatpak_browser_argv(self, browser, url):
+        """`flatpak run` argv for a Flatpak-installed browser, or None.
+
+        A Flatpak browser puts no binary on PATH, so _browser_executable finds
+        nothing and we'd fall back to the system default -- i.e. sign the user
+        in to a different browser than the one they picked, and then fail to
+        find those cookies. The app id is read back out of the profile path we
+        already detected, so it can't disagree with the cookies we'll read.
+        """
+        profile = self._browser_profile_dir(browser)
+        marker = os.path.join(os.path.expanduser('~'), '.var', 'app') + os.sep
+        if not profile or not profile.startswith(marker):
+            return None
+        app_id = profile[len(marker):].split(os.sep, 1)[0]
+        if not app_id or not shutil.which('flatpak'):
+            return None
+        return ['flatpak', 'run', app_id, url]
+
     def _open_youtube_in(self, browser):
         """Open YouTube in `browser`, falling back to the system default."""
+        url = 'https://www.youtube.com'
         exe = self._browser_executable(browser)
-        if exe:
+        argv = [exe, url] if exe else self._flatpak_browser_argv(browser, url)
+        if argv:
             try:
-                subprocess.Popen([exe, 'https://www.youtube.com'])
+                subprocess.Popen(argv)
                 return
             except Exception:
                 pass
         try:
-            webbrowser.open('https://www.youtube.com')
+            webbrowser.open(url)
         except Exception:
             pass
 
@@ -2113,6 +2321,9 @@ class VideoDownloaderApp(ctk.CTk):
         dialog.geometry("560x400")
         dialog.resizable(False, False)
         dialog.transient(self)
+        # Fixed size + non-resizable means a Linux crop here is unrecoverable.
+        if sys.platform.startswith('linux'):
+            dialog.after_idle(lambda: self._fit_to_content(dialog, 560, 400))
         self.set_toplevel_icon(dialog)
 
         ctk.CTkLabel(
@@ -2162,9 +2373,17 @@ class VideoDownloaderApp(ctk.CTk):
                                     "YouTube with (any \"Get cookies.txt\" extension), then "
                                     "click Retry Download.")
             elif src in self.CHROMIUM_BROWSERS:
-                hint.configure(text=f"{self._browser_label(src)} has to be closed completely "
-                                    f"before its cookies can be read — Windows keeps the "
-                                    f"cookie file locked while it's open.")
+                # The "close the browser first" rule is a Windows file-locking
+                # one. Linux doesn't lock the database; what stops it there is
+                # the cookies being encrypted against the desktop keyring.
+                if sys.platform == 'win32':
+                    hint.configure(text=f"{self._browser_label(src)} has to be closed completely "
+                                        f"before its cookies can be read — Windows keeps the "
+                                        f"cookie file locked while it's open.")
+                else:
+                    hint.configure(text=f"{self._browser_label(src)} can stay open. Its cookies "
+                                        f"are encrypted with your system keyring, so unlock "
+                                        f"KWallet / GNOME Keyring if this fails to read them.")
             else:
                 hint.configure(text=f"{self._browser_label(src)} can stay open while the "
                                     f"download runs.")
@@ -2712,6 +2931,8 @@ class VideoDownloaderApp(ctk.CTk):
         dialog.geometry("500x250")
         dialog.resizable(False, False)
         dialog.transient(self)
+        if sys.platform.startswith('linux'):
+            dialog.after_idle(lambda: self._fit_to_content(dialog, 500, 250))
         self.set_toplevel_icon(dialog)
 
         remember_var = ctk.BooleanVar(value=False)

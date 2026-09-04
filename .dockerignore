@@ -1,0 +1,4 @@
+# The build container only needs requirements.txt; keep the multi-hundred-MB
+# binaries and build output out of the context so `docker build` stays instant.
+*
+!requirements.txt

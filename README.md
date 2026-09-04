@@ -1,176 +1,83 @@
-# Building the Flatpak
+# Lace's Total Media Downloader
 
-> **Note:** Flatpak builds must be done on a Linux machine. You cannot build a
-> Flatpak on Windows. See the [CachyOS setup guide](#setting-up-a-linux-build-machine-cachyos)
-> below if you need to spin up a Linux environment first.
+A friendly desktop app for downloading video and audio from hundreds of sites,
+built on [yt-dlp](https://github.com/yt-dlp/yt-dlp) with a customtkinter UI.
 
----
+- Video up to 8K (`mp4`, `mkv`, `webm`, `avi`, `mov`, `flv`) or audio-only
+  (`mp3`, `m4a`, `opus`, `ogg`, `wav`, `flac`, `aac`)
+- Playlists — grab a single item or the whole thing
+- **Self-updating download engine.** Sites break extractors constantly, so the
+  app pulls the current yt-dlp *nightly* on every launch. That's what keeps
+  downloads working without you reinstalling anything.
+- YouTube sign-in by reading cookies live from a browser you're already logged
+  into, for age-restricted and members-only videos. No cookies are stored.
+- GPU-accelerated transcoding when a usable encoder is present, CPU otherwise
+- Bundled ffmpeg, so merging and conversion work out of the box
 
-## Setting up a Linux build machine (CachyOS)
+## Installing
 
-CachyOS is an Arch-based distro that works great as a build machine. These steps
-take you from a fresh install to a working Flatpak build.
+Grab the release asset for your platform:
 
-### 1. Install CachyOS
+| Platform | Asset | Notes |
+|----------|-------|-------|
+| Windows | `LacesTotalMediaDownloader_v<VERSION>.exe` | Run it. |
+| Linux | `LacesTotalMediaDownloader_v<VERSION>_linux` | `chmod +x` it and run it. |
 
-Download the ISO from [cachyos.org](https://cachyos.org), flash it to a USB
-(Rufus on Windows works fine), boot from it, and follow the graphical installer.
-KDE is the default desktop — pick whatever you like.
+Both are single self-contained files — no Python, no ffmpeg, nothing else to
+install. The app updates itself in place from GitHub releases and only ever
+offers you the build for the platform you're on.
 
-### 2. Get your code onto the machine
-
-Open a terminal and either clone the repo (once it's public):
-
-```bash
-sudo pacman -S git
-git clone https://github.com/LaceEditing/laces-total-media-downloader.git
-cd laces-total-media-downloader
-```
-
-Or copy the project folder over via USB drive / network share if the repo is
-still private.
-
-### 3. Install Flatpak tooling
-
-CachyOS may already have Flatpak installed, but make sure both tools are present:
+On Linux, to get it into your application menu with a proper icon:
 
 ```bash
-sudo pacman -S flatpak flatpak-builder
+./install-linux.sh /path/to/LacesTotalMediaDownloader_v3.8.0_linux
 ```
 
-### 4. Add Flathub and install the SDK + runtime
+## Where it keeps things
+
+| | Windows | Linux |
+|---|---|---|
+| Settings | `~/.lace_downloader_config.json` | `~/.lace_downloader_config.json` |
+| Downloaded engines (yt-dlp, Deno) | `%LOCALAPPDATA%\LacesTotalMediaDownloader\bin` | `~/.local/share/laces-total-media-downloader/bin` |
+
+Both are per-user and always writable, so the app works fine installed somewhere
+read-only.
+
+## Building
+
+Requires Python 3.11+ and PyInstaller. The same
+`LacesTotalMediaDownloader.spec` builds both platforms and branches on the OS
+internally; each has to be built on its own OS, since PyInstaller can't
+cross-compile.
+
+**Windows** — `ffmpeg.exe` and `ffprobe.exe` are committed to the repo, so:
 
 ```bash
-flatpak remote-add --if-not-exists flathub https://flathub.org/repo/flathub.flatpakrepo
-flatpak install flathub org.freedesktop.Platform//24.08 org.freedesktop.Sdk//24.08
+pip install -r requirements.txt pyinstaller
+pip install -U --pre "yt-dlp[default]"
+pyinstaller --noconfirm --clean LacesTotalMediaDownloader.spec
 ```
 
-This downloads the Freedesktop runtime (~600 MB) and SDK (~1.4 GB). The SDK is
-what `flatpak-builder` uses to compile everything inside the sandbox. Say `y`
-when prompted.
-
-### 5. Build the Flatpak
-
-From the root of your project directory (not inside `flatpak/`):
+**Linux** — to produce the file you actually ship:
 
 ```bash
-flatpak-builder --force-clean build-dir flatpak/com.laceediting.TotalMediaDownloader.yml
+packaging/release-linux.sh      # needs docker
 ```
 
-This will:
-- Download and compile SDL2, SDL2_mixer, SDL2_image (required by pygame)
-- `pip install` all Python dependencies (customtkinter, yt-dlp[default], pygame, requests, etc.)
-- Copy `main.py`, assets, the desktop entry, icon, and launcher script into place
+That builds inside an Ubuntu 22.04 container and writes both the binary and an
+upload-ready `.tar.gz` to `dist/`. Building it with your own Python instead
+gives you something that won't start on any distro older than yours.
 
-The first build takes a while due to SDL compilation. Subsequent builds use the
-cache and are much faster.
+For building locally to test a change, and for the two traps that produce a
+build which starts fine and looks broken, see **[BUILD_LINUX.md](BUILD_LINUX.md)**.
 
-### 6. Install and test locally
+## Requirements (running from source)
 
 ```bash
-flatpak-builder --user --install --force-clean build-dir flatpak/com.laceediting.TotalMediaDownloader.yml
-flatpak run com.laceediting.TotalMediaDownloader
+pip install -r requirements.txt
+python main.py
 ```
 
-Test that the GUI opens, a download works, and the notification sound plays.
-
-### 7. Export a distributable bundle
-
-```bash
-flatpak-builder --repo=repo --force-clean build-dir flatpak/com.laceediting.TotalMediaDownloader.yml
-flatpak build-bundle repo LacesTotalMediaDownloader.flatpak com.laceediting.TotalMediaDownloader
-```
-
-This produces `LacesTotalMediaDownloader.flatpak` — a single file anyone can
-install without Flathub:
-
-```bash
-flatpak install LacesTotalMediaDownloader.flatpak
-```
-
-### 8. Uninstall (cleanup)
-
-```bash
-flatpak uninstall com.laceediting.TotalMediaDownloader
-```
-
----
-
-## Quick reference — what you're installing on CachyOS
-
-| Package | Command | Why |
-|---------|---------|-----|
-| `git` | `pacman -S git` | Clone your repo |
-| `flatpak` | `pacman -S flatpak` | Flatpak runtime |
-| `flatpak-builder` | `pacman -S flatpak-builder` | Builds Flatpaks from manifests |
-| Freedesktop SDK 24.08 | `flatpak install` | Sandbox environment for building |
-
----
-
-## Prerequisites (generic — any distro)
-
-Install Flatpak and flatpak-builder on your Linux system:
-
-```bash
-# Arch / CachyOS / Manjaro
-sudo pacman -S flatpak flatpak-builder
-
-# Debian / Ubuntu
-sudo apt install flatpak flatpak-builder
-
-# Fedora
-sudo dnf install flatpak flatpak-builder
-```
-
-Add Flathub and install the SDK:
-
-```bash
-flatpak remote-add --if-not-exists flathub https://flathub.org/repo/flathub.flatpakrepo
-flatpak install flathub org.freedesktop.Platform//24.08 org.freedesktop.Sdk//24.08
-```
-
-## Build
-
-From the repository root:
-
-```bash
-flatpak-builder --force-clean build-dir flatpak/com.laceediting.TotalMediaDownloader.yml
-```
-
-## Install locally (for testing)
-
-```bash
-flatpak-builder --user --install --force-clean build-dir flatpak/com.laceediting.TotalMediaDownloader.yml
-```
-
-## Run
-
-```bash
-flatpak run com.laceediting.TotalMediaDownloader
-```
-
-## Uninstall
-
-```bash
-flatpak uninstall com.laceediting.TotalMediaDownloader
-```
-
-## Export to a .flatpak bundle (for distribution)
-
-```bash
-flatpak-builder --repo=repo --force-clean build-dir flatpak/com.laceediting.TotalMediaDownloader.yml
-flatpak build-bundle repo LacesTotalMediaDownloader.flatpak com.laceediting.TotalMediaDownloader
-```
-
-The resulting `LacesTotalMediaDownloader.flatpak` file can be distributed and installed with:
-
-```bash
-flatpak install LacesTotalMediaDownloader.flatpak
-```
-
-## Notes
-
-- FFmpeg is included in the `org.freedesktop.Platform` runtime, so it's available automatically.
-- yt-dlp auto-updates are disabled inside Flatpak (detected via `/.flatpak-info`). Update the Flatpak package itself to get yt-dlp updates.
-- App update checks are also skipped in Flatpak — users should update through their Flatpak manager.
-- The app saves its config to `~/.lace_downloader_config.json` (accessible via `--filesystem=home`).
+`ffmpeg` needs to be on your PATH, or sitting next to `main.py`. Without it the
+app still runs but can only fetch single-format files — no merging, no
+conversion to mp3.

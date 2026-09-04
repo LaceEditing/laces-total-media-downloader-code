@@ -3,7 +3,7 @@
 # Cross-platform ONEFILE build spec for Lace's Total Media Downloader.
 # Build with:   pyinstaller LacesTotalMediaDownloader.spec
 #   Windows -> dist/LacesTotalMediaDownloader_v<VERSION>.exe
-#   Linux   -> dist/LacesTotalMediaDownloader_v<VERSION>      (ELF, no extension)
+#   Linux   -> dist/LacesTotalMediaDownloader_v<VERSION>_linux  (ELF, no extension)
 #
 # Linux build prerequisites (see BUILD_LINUX.md): a tkinter-enabled Python
 # (apt install python3-tk), the deps from requirements.txt + pyinstaller, and
@@ -86,6 +86,19 @@ a = Analysis(
     noarchive=False,
 )
 
+if not IS_WIN:
+    # Never ship the BUILD machine's font stack. fontconfig reads the *host's*
+    # /etc/fonts at runtime, so a copy from an older build container fails to
+    # parse a newer distro's config and quietly loses font fallback -- which on
+    # a current Arch host emptied the toolbar button of its glyph. Every desktop
+    # Linux already has these, and the system copy always matches its own config.
+    #
+    # Only the bare sonames are dropped: pygame ships a privately-versioned
+    # libfreetype-<hash>.so that only it loads, and that one has to stay.
+    _use_system = ('libfontconfig.so', 'libfreetype.so')
+    a.binaries = [entry for entry in a.binaries
+                  if not os.path.basename(entry[0]).startswith(_use_system)]
+
 pyz = PYZ(a.pure, a.zipped_data, cipher=block_cipher)
 
 # ONEFILE: passing a.binaries + a.datas into EXE() (with no COLLECT step) bundles
@@ -96,7 +109,11 @@ exe = EXE(
     a.binaries,
     a.datas,
     [],
-    name=f'LacesTotalMediaDownloader_v{VERSION}',
+    # The '_linux' suffix is load-bearing: the in-app updater picks a release
+    # asset by name, and only takes a Linux one that says so
+    # (see _platform_release_asset in main.py).
+    name=f'LacesTotalMediaDownloader_v{VERSION}'
+         + ('' if IS_WIN else '_linux'),
     debug=False,
     bootloader_ignore_signals=False,
     strip=False,

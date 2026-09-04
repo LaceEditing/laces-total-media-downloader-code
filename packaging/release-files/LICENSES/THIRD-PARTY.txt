@@ -1,0 +1,59 @@
+Third-party components in this release
+======================================
+
+Lace's Total Media Downloader ships as one self-contained executable. The
+components below are bundled inside it. Full licence texts are in this folder.
+
+
+FFmpeg / ffprobe 7.0.2 — GNU General Public License, version 3
+--------------------------------------------------------------
+    Static build obtained from https://johnvansickle.com/ffmpeg/
+    Configured with --enable-gpl --enable-version3 (includes libx264, libx265).
+
+    Licence text .... ffmpeg-GPLv3.txt
+    Build details ... ffmpeg-build-readme.txt
+    Source code ..... https://ffmpeg.org/releases/ffmpeg-7.0.2.tar.xz
+                      Also available from the build's publisher at the URL above.
+
+    FFmpeg is executed as a separate program by this application. It is not
+    linked into it.
+
+
+pygame-ce 2.5.8 — GNU Lesser General Public License, version 2.1
+-----------------------------------------------------------------
+    https://github.com/pygame-community/pygame-ce
+    Licence text .... pygame-ce-LGPL-2.1.txt
+    The library is bundled as unmodified shared objects and may be replaced.
+
+
+yt-dlp — The Unlicense (public domain)
+---------------------------------------
+    https://github.com/yt-dlp/yt-dlp
+    A current build is also downloaded at runtime into
+    ~/.local/share/laces-total-media-downloader/
+
+
+Other bundled components
+------------------------
+    CustomTkinter 6.0.0 ....... CC0 1.0 Universal (public domain dedication)
+    Requests 2.34.2 ........... Apache License 2.0
+    Pillow 12.3.0 ............. MIT-CMU (HPND)
+    packaging 26.3 ............ Apache License 2.0 / BSD-2-Clause
+    Python 3.10.12 ............ Python Software Foundation License
+    Tcl/Tk 8.6 ................ Tcl/Tk licence (BSD-style)
+
+
+Fonts
+-----
+    Bubblegum Sans ... SIL Open Font License 1.1
+                       Copyright (c) 2011 Angel Koziupa and Alejandro Paul
+                       Licence text: BubblegumSans-OFL-1.1.txt
+    Roboto ........... Apache License 2.0 (supplied by CustomTkinter)
+    Bartino .......... bundled UI font
+
+
+Downloaded at first run, not bundled
+------------------------------------
+    Deno ............. MIT License — https://github.com/denoland/deno
+                       Fetched only if no JavaScript runtime is already
+                       installed; required for YouTube playback URLs.
