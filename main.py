@@ -62,6 +62,34 @@ import requests
 from packaging import version
 import tempfile
 import webbrowser
+import hashlib
+import shlex
+import signal
+import time
+from dataclasses import dataclass, field
+
+
+@dataclass
+class DownloadJob:
+    """One click of DOWNLOAD, carried through every dialog and retry it leads to.
+
+    Exactly one job exists while a download is in flight. Whichever path ends it
+    (completion, error, cancel, a dialog's Cancel button) calls _end_download()
+    once; the playlist / 4K / sign-in dialogs hand the same job on instead.
+    """
+    url: str
+    settings: dict
+    cancel: threading.Event = field(default_factory=threading.Event)
+    process: object = None                   # the yt-dlp child currently running, if any
+    paths: set = field(default_factory=set)  # files yt-dlp said it was writing
+    saved: list = field(default_factory=list)  # final files, in completion order
+    saved_log: str = None                    # file the external engine logs them to
+    expected: int = 1                        # items we expect (playlist size)
+    last_progress: float = 0.0               # monotonic time of the last progress repaint
+
+
+class DownloadCancelledError(Exception):
+    """Raised on a worker thread once the user has cancelled the job."""
 
 
 class VideoDownloaderApp(ctk.CTk):
@@ -86,7 +114,7 @@ class VideoDownloaderApp(ctk.CTk):
     LINUX_WINDOW_SIZE = (1430, 1063)
 
     # Version of the app - update this with each release
-    CURRENT_VERSION = "3.8.0"
+    CURRENT_VERSION = "3.9.0"
     # GitHub repository for updates
     GITHUB_REPO = "LaceEditing/laces-total-media-downloader"
 
@@ -100,7 +128,7 @@ class VideoDownloaderApp(ctk.CTk):
     YTDLP_RELEASE_BASE = f"https://github.com/{YTDLP_UPDATE_REPO}/releases/latest/download/"
     YTDLP_API_LATEST = f"https://api.github.com/repos/{YTDLP_UPDATE_REPO}/releases/latest"
 
-    def __init__(self, CURRENT_VERSION=CURRENT_VERSION):
+    def __init__(self):
         # X11 identifies a window by WM_CLASS, and that is what a desktop
         # environment matches against a .desktop file's StartupWMClass to give
         # the window its name and icon in the taskbar. Tk defaults it to "Tk",
@@ -109,7 +137,7 @@ class VideoDownloaderApp(ctk.CTk):
                             if sys.platform.startswith('linux') else {}))
 
         # Window setup
-        self.title(f"Hey besties let's download those files! (v{CURRENT_VERSION})")
+        self.title(f"Hey besties let's download those files! (v{self.CURRENT_VERSION})")
         self.geometry("950x700")
         self.minsize(850, 700)
 
@@ -141,20 +169,19 @@ class VideoDownloaderApp(ctk.CTk):
         # Variables
         self.download_type = ctk.StringVar(value="video")
         self.quality = ctk.StringVar(value="1080p")
-        self.audio_quality = ctk.StringVar(value="320")
+        self.audio_quality = ctk.StringVar(value="320 kbps")
         self.video_format = ctk.StringVar(value="mp4")
         self.audio_format = ctk.StringVar(value="mp3")
         self.output_folder = ctk.StringVar(value=str(Path.home() / "Downloads"))
         self.is_downloading = False
+        self._job = None  # the DownloadJob in flight, if any
         self.ffmpeg_available = self.check_ffmpeg()
-        self.downloaded_file_path = None
 
         # Load persisted config (recent folders, high-res notice prefs)
         cfg = self.load_config()
-        self.recent_folders = cfg.get('recent_folders', [])
+        self.recent_folders = [f for f in cfg.get('recent_folders', []) if isinstance(f, str)]
         self.hires_codec_default = cfg.get('hires_codec_default', 'auto')  # auto|h264|hevc
         self.ask_hires_codec = cfg.get('ask_hires_codec', True)
-        self.prefer_gpu = True
 
         # Sign-in source is session-only. Browser cookies are read live by yt-dlp
         # for YouTube auth; the app does not persist/export them.
@@ -172,6 +199,12 @@ class VideoDownloaderApp(ctk.CTk):
         # Set after a YouTube sign-in/age wall so the retry widens player_client.
         self._widen_player_clients = False
         self.hw_encoders = {}  # Populated by _detect_hw_encoders: {'h264': enc, 'hevc': enc}
+        # Set once the GPU probe has finished (or can't run). A download that has
+        # to decide between a GPU transcode and the MKV fallback waits on it.
+        self._hw_probe_done = threading.Event()
+        if not self.ffmpeg_available:
+            self._hw_probe_done.set()
+        self._cleanup_replaced_binaries()
 
         # Load custom fonts
         self.load_custom_fonts()
@@ -183,6 +216,10 @@ class VideoDownloaderApp(ctk.CTk):
         if sys.platform.startswith('linux'):
             self.after_idle(self._fit_window_to_content)
 
+        # Closing the window must also stop yt-dlp/ffmpeg, which otherwise keep
+        # running hidden in the background.
+        self.protocol("WM_DELETE_WINDOW", self.on_close)
+
         # Show ffmpeg warning if not available
         if not self.ffmpeg_available:
             self.after(500, self.show_ffmpeg_warning)
@@ -190,6 +227,10 @@ class VideoDownloaderApp(ctk.CTk):
         # Probe usable GPU encoders in the background so high-res transcodes are fast
         if self.ffmpeg_available:
             self.after(200, self._detect_hw_encoders)
+
+        # A replaced exe can still be running for a moment after an update, so
+        # sweep its leftover once more after startup has settled.
+        self.after(10000, self._cleanup_replaced_binaries)
 
         # Update yt-dlp on startup to prevent HTTP 403 errors
         self.after(100, self.update_ytdlp)
@@ -248,6 +289,225 @@ class VideoDownloaderApp(ctk.CTk):
         except Exception:
             pass
         super().destroy()
+
+    def on_close(self):
+        """Stop the running download (and the ffmpeg it started) before closing."""
+        job = self._job
+        if job is not None:
+            job.cancel.set()
+            self._kill_process_tree(job.process)
+            self._remove_partial_files(job)
+        self.destroy()
+
+    # ------------------------------------------------------------------ #
+    #  Child processes, partial files and verified downloads              #
+    # ------------------------------------------------------------------ #
+    _NO_WINDOW = subprocess.CREATE_NO_WINDOW if sys.platform == 'win32' else 0
+
+    @staticmethod
+    def _child_env():
+        """Environment for programs we start (yt-dlp, a browser, xdg-open, ...).
+
+        A frozen build carries variables meant only for itself: a onefile
+        PyInstaller program started from another one inherits its parent's
+        extraction folder unless told to reset, and on Linux LD_LIBRARY_PATH
+        points at the bundled libraries, which the system browser must not load.
+        """
+        env = dict(os.environ)
+        if getattr(sys, 'frozen', False):
+            env['PYINSTALLER_RESET_ENVIRONMENT'] = '1'
+            if sys.platform.startswith('linux'):
+                original = env.pop('LD_LIBRARY_PATH_ORIG', None)
+                if original is not None:
+                    env['LD_LIBRARY_PATH'] = original
+                else:
+                    env.pop('LD_LIBRARY_PATH', None)
+        return env
+
+    def _popen_for_job(self, job, cmd, **kwargs):
+        """Start a child for `job`, where Cancel and window-close can reach it."""
+        if sys.platform != 'win32':
+            kwargs.setdefault('start_new_session', True)  # own group, for killpg
+        process = subprocess.Popen(cmd, env=self._child_env(),
+                                   creationflags=self._NO_WINDOW, **kwargs)
+        if job is not None:
+            job.process = process
+            if job.cancel.is_set():  # cancelled while it was starting
+                self._kill_process_tree(process)
+        return process
+
+    @classmethod
+    def _kill_process_tree(cls, process):
+        """Kill a yt-dlp child and the ffmpeg it started. Safe to repeat."""
+        if process is None or process.poll() is not None:
+            return
+        try:
+            if sys.platform == 'win32':
+                # yt-dlp runs ffmpeg as its own child; /T takes that down too.
+                subprocess.run(['taskkill', '/PID', str(process.pid), '/T', '/F'],
+                               capture_output=True, timeout=15,
+                               creationflags=cls._NO_WINDOW)
+            else:
+                os.killpg(process.pid, signal.SIGKILL)
+        except Exception:
+            pass
+        try:
+            process.kill()
+            process.wait(timeout=10)
+        except Exception:
+            pass
+
+    @staticmethod
+    def _saved_paths(job):
+        """Final files this job finished, including ones only yt-dlp has logged."""
+        paths = list(job.saved)
+        log = getattr(job, 'saved_log', None)
+        if log:
+            try:
+                with open(log, encoding='utf-8', errors='replace') as f:
+                    paths += [line.strip() for line in f if line.strip()]
+            except OSError:
+                pass
+        return paths
+
+    @staticmethod
+    def _partial_file_candidates(path):
+        """Leftovers yt-dlp/ffmpeg can leave behind for `path` when interrupted."""
+        root, ext = os.path.splitext(path)
+        candidates = [path, path + '.part', path + '.ytdl', root + '.temp' + ext]
+        candidates += glob.glob(glob.escape(path) + '.part-Frag*')
+        return candidates
+
+    def _remove_partial_files(self, job):
+        """Delete what a cancelled job left half-written. Finished files stay.
+
+        Only paths yt-dlp itself reported for this job are touched; nothing is
+        pattern-matched across the user's folder.
+        """
+        keep = {os.path.normcase(os.path.abspath(p)) for p in self._saved_paths(job)}
+        for path in list(job.paths):
+            for candidate in self._partial_file_candidates(path):
+                if os.path.normcase(os.path.abspath(candidate)) in keep:
+                    continue
+                for _ in range(10):  # Windows frees handles a moment after taskkill
+                    try:
+                        os.remove(candidate)
+                        break
+                    except FileNotFoundError:
+                        break
+                    except OSError:
+                        time.sleep(0.2)
+
+    @staticmethod
+    def _parse_sha256(text, name=None):
+        """The SHA-256 for `name` in a checksum listing, or the first one when unnamed.
+
+        Handles both `<hash>  <file>` listings (yt-dlp's SHA2-256SUMS) and
+        PowerShell Get-FileHash output (Deno's Windows .sha256sum).
+        """
+        if not text:
+            return None
+        if name:
+            for line in text.splitlines():
+                parts = line.split()
+                if (len(parts) >= 2 and parts[-1].lstrip('*') == name
+                        and re.fullmatch(r'[0-9a-fA-F]{64}', parts[0])):
+                    return parts[0].lower()
+            return None
+        match = re.search(r'\b[0-9a-fA-F]{64}\b', text)
+        return match.group(0).lower() if match else None
+
+    @staticmethod
+    def _fetch_text(url, timeout=15):
+        """GET a small text file (a checksum listing), or None if unavailable."""
+        try:
+            response = requests.get(url, timeout=timeout)
+            if response.status_code == 200:
+                return response.text
+        except Exception:
+            pass
+        return None
+
+    @staticmethod
+    def _download_to(url, dest_dir, expected_sha256=None, min_size=0, timeout=60,
+                     on_progress=None):
+        """Stream `url` into a temp file in `dest_dir`, check it, return its path.
+
+        Streams rather than buffering, so a ~100 MB engine never sits in memory.
+        A short read, a file under `min_size` or a SHA-256 mismatch raises and
+        removes the temp file; the caller moves a good one into place.
+        """
+        fd, temp_path = tempfile.mkstemp(prefix='.download-', suffix='.tmp', dir=dest_dir)
+        digest = hashlib.sha256()
+        written = 0
+        try:
+            with os.fdopen(fd, 'wb') as f, \
+                    requests.get(url, stream=True, timeout=timeout) as response:
+                response.raise_for_status()
+                total = int(response.headers.get('content-length') or 0)
+                for chunk in response.iter_content(chunk_size=1 << 16):
+                    f.write(chunk)
+                    digest.update(chunk)
+                    written += len(chunk)
+                    if on_progress and total:
+                        on_progress(written / total)
+            if total and written != total:
+                raise Exception("Download incomplete - file size mismatch")
+            if written < min_size:
+                raise Exception("Downloaded file is too small, possibly corrupt")
+            if expected_sha256 and digest.hexdigest() != expected_sha256.lower():
+                raise Exception("Downloaded file failed its SHA-256 check")
+            return temp_path
+        except BaseException:
+            try:
+                os.remove(temp_path)
+            except OSError:
+                pass
+            raise
+
+    @staticmethod
+    def _swap_in(new_path, dest):
+        """Move `new_path` onto `dest`, even while `dest` is a running program.
+
+        Windows won't overwrite or delete a running .exe but does let it be
+        renamed, so the current file steps aside to *.old first. The leftover is
+        deleted now if possible, otherwise by _cleanup_replaced_binaries later.
+        """
+        old = None
+        if os.path.exists(dest):
+            old = f"{dest}.{os.getpid()}-{time.time_ns()}.old"
+            os.replace(dest, old)
+        try:
+            os.replace(new_path, dest)
+        except OSError:
+            if old and not os.path.exists(dest):
+                os.replace(old, dest)
+            raise
+        if old:
+            try:
+                os.remove(old)
+            except OSError:
+                pass
+
+    def _cleanup_replaced_binaries(self):
+        """Delete *.old leftovers from a swap whose program was still running.
+
+        Only our own names are matched: the exe may live in Downloads, next to
+        files of the user's that happen to end in .old.
+        """
+        patterns = []
+        try:
+            patterns.append(os.path.join(glob.escape(self._engine_dir()), '*.old'))
+        except Exception:
+            pass
+        if getattr(sys, 'frozen', False):
+            patterns.append(glob.escape(sys.executable) + '.*.old')
+        for pattern in patterns:
+            for old in glob.glob(pattern):
+                try:
+                    os.remove(old)
+                except OSError:
+                    pass
 
 
 
@@ -362,29 +622,26 @@ class VideoDownloaderApp(ctk.CTk):
             # back to the default font.
             self.bartino_font_path = os.path.join(base_path, 'assets', 'fonts', 'Bartino.ttf')
 
-            # On Linux, copy fonts to ~/.fonts so Tk/fontconfig can find them
-            if sys.platform.startswith('linux'):
-                linux_font_dir = os.path.expanduser('~/.fonts')
-                os.makedirs(linux_font_dir, exist_ok=True)
-                for font_file in (self.bubblegum_font_path, self.bartino_font_path):
-                    if os.path.exists(font_file):
-                        dest = os.path.join(linux_font_dir, os.path.basename(font_file))
-                        if not os.path.exists(dest):
-                            try:
-                                shutil.copy(font_file, dest)
-                            except OSError:
-                                pass
-
             # Check if fonts exist
             self.has_bubblegum = os.path.exists(self.bubblegum_font_path)
             self.has_bartino = os.path.exists(self.bartino_font_path)
+
+            # Linux gets them through ~/.fonts + fc-cache at the top of this
+            # file. Windows and macOS only draw a font that is installed or
+            # registered with the process -- the files merely existing left the
+            # title in the default font on any PC without them installed.
+            if not sys.platform.startswith('linux'):
+                if self.has_bubblegum:
+                    self.has_bubblegum = bool(ctk.FontManager.load_font(self.bubblegum_font_path))
+                if self.has_bartino:
+                    self.has_bartino = bool(ctk.FontManager.load_font(self.bartino_font_path))
         except Exception:
             self.has_bubblegum = False
             self.has_bartino = False
 
     @staticmethod
     def _platform_release_asset(assets):
-        """URL of the release asset built for THIS platform, or None.
+        """The release asset (GitHub API dict) built for THIS platform, or None.
 
         Matching on ".exe" alone offered Linux users the Windows build and then
         told them to run it. Each platform now only ever accepts its own
@@ -407,9 +664,18 @@ class VideoDownloaderApp(ctk.CTk):
                 return 'linux' in name or name.endswith('.appimage')
 
         for asset in assets:
-            if matches((asset.get('name') or '').lower()):
-                return asset.get('browser_download_url')
+            if matches((asset.get('name') or '').lower()) and asset.get('browser_download_url'):
+                return asset
         return None
+
+    @staticmethod
+    def _can_self_update():
+        """Only a built app replaces itself.
+
+        Run from source, the "current exe" is main.py -- and the old updater
+        moved the downloaded binary straight over it.
+        """
+        return getattr(sys, 'frozen', False)
 
     def check_for_updates(self):
         """Check for updates from GitHub releases"""
@@ -419,6 +685,8 @@ class VideoDownloaderApp(ctk.CTk):
             # Check if running in Flatpak or Snap
             if os.path.exists('/.flatpak-info') or os.environ.get('SNAP'):
                 return  # Don't check for updates in containerized environments
+        if not self._can_self_update():
+            return
 
         def check():
             try:
@@ -433,10 +701,10 @@ class VideoDownloaderApp(ctk.CTk):
                     # Compare versions
                     if version.parse(latest_version) > version.parse(self.CURRENT_VERSION):
                         # Found newer version
-                        download_url = self._platform_release_asset(data.get('assets', []))
+                        asset = self._platform_release_asset(data.get('assets', []))
 
-                        if download_url:
-                            self.after(0, lambda: self.show_update_dialog(latest_version, download_url,
+                        if asset:
+                            self.after(0, lambda: self.show_update_dialog(latest_version, asset,
                                                                           data.get('body', '')))
             except Exception:
                 pass  # Silently fail if update check fails
@@ -465,10 +733,17 @@ class VideoDownloaderApp(ctk.CTk):
                     # Compare versions
                     if version.parse(latest_version) > version.parse(self.CURRENT_VERSION):
                         # Found newer version
-                        download_url = self._platform_release_asset(data.get('assets', []))
+                        asset = self._platform_release_asset(data.get('assets', []))
 
-                        if download_url:
-                            self.after(0, lambda: self.show_update_dialog(latest_version, download_url,
+                        if not self._can_self_update():
+                            self.after(0, lambda: messagebox.showinfo(
+                                "Update Available",
+                                f"Version {latest_version} is out (you're running "
+                                f"{self.CURRENT_VERSION} from source).\n\n"
+                                "Pull the latest code to update."
+                            ))
+                        elif asset:
+                            self.after(0, lambda: self.show_update_dialog(latest_version, asset,
                                                                           data.get('body', '')))
                         else:
                             self.after(0, lambda: messagebox.showinfo(
@@ -494,9 +769,11 @@ class VideoDownloaderApp(ctk.CTk):
                         f"Failed to check for updates (HTTP {response.status_code}).\nPlease try again later."
                     ))
             except Exception as e:
-                self.after(0, lambda: messagebox.showerror(
+                # Bind the error now: Python deletes `e` when this block ends,
+                # long before Tk runs the callback.
+                self.after(0, lambda err=e: messagebox.showerror(
                     "Update Check Failed",
-                    f"Failed to check for updates:\n{str(e)}"
+                    f"Failed to check for updates:\n{err}"
                 ))
             finally:
                 self.after(0, lambda: self.update_status(default_status, append=False))
@@ -547,7 +824,7 @@ class VideoDownloaderApp(ctk.CTk):
                     pass
         self.after(0, apply)
 
-    def _await_engine(self, timeout=45):
+    def _await_engine(self, job=None, timeout=45):
         """Block until the startup engine update settles (or times out).
 
         Safe to call only from a download worker thread -- never the Tk thread.
@@ -563,7 +840,13 @@ class VideoDownloaderApp(ctk.CTk):
             return True
         self.after(0, lambda: self.update_status(
             "Updating download engine, one moment...", append=False))
-        ready = self._engine_ready.wait(timeout=timeout)
+        deadline = time.monotonic() + timeout
+        ready = False
+        while time.monotonic() < deadline:
+            ready = self._engine_ready.wait(timeout=0.25)
+            if ready:
+                break
+            self._raise_if_cancelled(job)
         if not ready:
             self.after(0, lambda: self.update_status(
                 "Download engine is still updating; continuing with the current one.",
@@ -652,43 +935,34 @@ class VideoDownloaderApp(ctk.CTk):
                                 f"Download engine is up to date ({v})."))
                             return
 
-                    # Download to a temp file first, then rename (atomic-ish)
-                    temp_path = ytdlp_exe_path + '.tmp'
+                    self.after(0, lambda: self.update_status(
+                        "Updating download engine (yt-dlp nightly)..."))
+                    # This binary is executed on every download, so check it
+                    # against the release's published checksum, not just its size.
+                    expected = self._parse_sha256(
+                        self._fetch_text(base_url + 'SHA2-256SUMS'), ytdlp_url.rsplit('/', 1)[-1])
+                    temp_path = self._download_to(ytdlp_url, engine_dir, expected,
+                                                  min_size=min_size, timeout=120)
                     try:
-                        self.after(0, lambda: self.update_status(
-                            "Updating download engine (yt-dlp nightly)..."))
-                        response = requests.get(ytdlp_url, timeout=120)
-                        if response.status_code == 200:
-                            with open(temp_path, 'wb') as f:
-                                f.write(response.content)
+                        if sys.platform != 'win32':
+                            os.chmod(temp_path, 0o755)
+                        # A download may be running the current copy right now;
+                        # _swap_in moves it aside instead of failing on it.
+                        self._swap_in(temp_path, ytdlp_exe_path)
+                    except BaseException:
+                        try:
+                            os.remove(temp_path)
+                        except OSError:
+                            pass
+                        raise
 
-                            # Verify the download isn't truncated/corrupt
-                            if os.path.getsize(temp_path) < min_size:
-                                os.remove(temp_path)
-                                raise Exception("Downloaded yt-dlp binary is too small, possibly corrupt")
-
-                            # Replace the real file
-                            shutil.move(temp_path, ytdlp_exe_path)
-
-                            # Make executable on Linux/Mac
-                            if sys.platform != 'win32':
-                                os.chmod(ytdlp_exe_path, 0o755)
-
-                            self.ytdlp_exe_path = ytdlp_exe_path
-                            new_version = self._get_local_ytdlp_version(ytdlp_exe_path)
-                            self._set_engine_label(new_version or 'updated')
-                            self.after(0, lambda v=new_version: self.update_status(
-                                f"Download engine updated ({v})!" if v
-                                else "Download engine updated!"))
-                        else:
-                            raise Exception(f"Download failed with status {response.status_code}")
-                    finally:
-                        # Clean up temp file if it still exists
-                        if os.path.exists(temp_path):
-                            try:
-                                os.remove(temp_path)
-                            except Exception:
-                                pass
+                    self.ytdlp_exe_path = ytdlp_exe_path
+                    new_version = self._get_local_ytdlp_version(ytdlp_exe_path)
+                    self._set_engine_label(new_version or 'updated')
+                    verified = "checksum verified" if expected else "no checksum published"
+                    self.after(0, lambda v=new_version, c=verified: self.update_status(
+                        f"Download engine updated ({v}, {c})!" if v
+                        else f"Download engine updated ({c})!"))
                 else:
                     # Development/unfrozen: refresh the installed library. `--pre`
                     # is what selects nightly on PyPI; without it pip stays on
@@ -721,7 +995,7 @@ class VideoDownloaderApp(ctk.CTk):
                 self._set_engine_label(
                     (self._get_local_ytdlp_version(self.ytdlp_exe_path) or 'unknown')
                     if self._have_ytdlp_exe() else self._library_version_label())
-                self.after(0, lambda: self.update_status(f"Download engine update failed: {e}"))
+                self.after(0, lambda err=e: self.update_status(f"Download engine update failed: {err}"))
             finally:
                 # Whatever happened, never leave a download blocked waiting on us.
                 self._engine_ready.set()
@@ -733,9 +1007,9 @@ class VideoDownloaderApp(ctk.CTk):
     def _get_local_ytdlp_version(self, exe_path):
         """Return the version string of the local yt-dlp binary, or None."""
         try:
-            creationflags = subprocess.CREATE_NO_WINDOW if sys.platform == 'win32' else 0
             result = subprocess.run([exe_path, '--version'], capture_output=True,
-                                    text=True, timeout=15, creationflags=creationflags)
+                                    encoding='utf-8', errors='replace', timeout=15,
+                                    creationflags=self._NO_WINDOW, env=self._child_env())
             if result.returncode == 0:
                 return result.stdout.strip()
         except Exception:
@@ -766,29 +1040,127 @@ class VideoDownloaderApp(ctk.CTk):
             version_str = self._get_local_ytdlp_version(self.ytdlp_exe_path) or 'unknown'
             return f"yt-dlp {version_str} (auto-updating)"
         return f"yt-dlp {self._library_version_label()}"
-    def run_ytdlp_download(self, ydl_opts, url):
-        """Run yt-dlp download using either external exe or bundled library"""
-        is_frozen = getattr(sys, 'frozen', False)
 
+    @staticmethod
+    def _raise_if_cancelled(job, exc=DownloadCancelledError):
+        """Stop a worker at a safe point once the user has cancelled its job."""
+        if job is not None and job.cancel.is_set():
+            raise exc()
+
+    def run_ytdlp_download(self, job, ydl_opts, url):
+        """Run a download with the external engine or the bundled library.
+
+        Either way the final file paths end up in job.saved; failures raise.
+        """
         # If frozen and we have an external yt-dlp.exe, use it via subprocess
-        if is_frozen and self._have_ytdlp_exe():
-            return self._run_ytdlp_subprocess(ydl_opts, url)
+        if getattr(sys, 'frozen', False) and self._have_ytdlp_exe():
+            self._run_ytdlp_subprocess(job, ydl_opts, url)
         else:
-            # Use bundled library
-            return self._run_ytdlp_library(ydl_opts, url)
+            self._run_ytdlp_library(job, ydl_opts, url)
 
-    def _run_ytdlp_library(self, ydl_opts, url):
+    def _run_ytdlp_library(self, job, ydl_opts, url):
         """Run yt-dlp using the bundled Python library"""
         # Make a copy of options to avoid modifying the original
         opts = ydl_opts.copy()
         self._apply_js_runtime_opts(opts)
-        # Add progress hook for library version
-        if 'progress_hooks' not in opts:
-            opts['progress_hooks'] = [self.progress_hook]
 
-        with yt_dlp.YoutubeDL(opts) as ydl:
-            result = ydl.extract_info(url, download=True)
-            return result
+        def on_progress(d):
+            # Raising yt-dlp's own exception is how a hook stops a download cleanly.
+            self._raise_if_cancelled(job, yt_dlp.utils.DownloadCancelled)
+            for key in ('filename', 'tmpfilename'):
+                if d.get(key):
+                    job.paths.add(d[key])
+            self.progress_hook(d, job)
+
+        def on_postprocess(d):
+            self._raise_if_cancelled(job, yt_dlp.utils.DownloadCancelled)
+            # MoveFiles is the last step for every item; its filepath is final.
+            if d.get('status') == 'finished' and d.get('postprocessor') == 'MoveFiles':
+                path = (d.get('info_dict') or {}).get('filepath')
+                if path:
+                    job.saved.append(path)
+
+        opts['progress_hooks'] = [on_progress]
+        opts['postprocessor_hooks'] = [on_postprocess]
+        try:
+            with yt_dlp.YoutubeDL(opts) as ydl:
+                ydl.extract_info(url, download=True)
+        except yt_dlp.utils.DownloadCancelled:
+            raise DownloadCancelledError()
+        self._raise_if_cancelled(job)
+
+    # One machine-readable line per progress tick from the external engine.
+    # yt-dlp prints NA for any value it doesn't know yet.
+    PROGRESS_MARKER = '[lace-progress]'
+    PROGRESS_TEMPLATE = (PROGRESS_MARKER + ' %(progress.downloaded_bytes)s'
+                         ' %(progress.total_bytes)s %(progress.total_bytes_estimate)s'
+                         ' %(progress.speed)s %(progress.eta)s')
+
+    @classmethod
+    def _parse_progress_line(cls, line):
+        """(downloaded, total, speed, eta) from a PROGRESS_TEMPLATE line, else None."""
+        if not line.startswith(cls.PROGRESS_MARKER):
+            return None
+        fields = line[len(cls.PROGRESS_MARKER):].split()
+        if len(fields) != 5:
+            return None
+
+        def number(text):
+            try:
+                value = float(text)
+                return value if value >= 0 else None
+            except ValueError:
+                return None
+
+        downloaded, total, estimate, speed, eta = (number(f) for f in fields)
+        return downloaded, total or estimate, speed, eta
+
+    @staticmethod
+    def _format_bytes(count):
+        for unit in ('B', 'KiB', 'MiB', 'GiB'):
+            if count < 1024 or unit == 'GiB':
+                return f"{count:.0f} {unit}" if unit == 'B' else f"{count:.1f} {unit}"
+            count /= 1024
+
+    @staticmethod
+    def _format_eta(seconds):
+        seconds = int(seconds)
+        hours, rest = divmod(seconds, 3600)
+        minutes, secs = divmod(rest, 60)
+        return f"{hours}:{minutes:02d}:{secs:02d}" if hours else f"{minutes}:{secs:02d}"
+
+    def _report_progress(self, job, downloaded, total, speed, eta, force=False):
+        """Show progress in the header, at most ~4 times a second.
+
+        Progress used to replace the whole status log on every tick, wiping out
+        notes like the MKV warning as soon as they appeared.
+        """
+        now = time.monotonic()
+        if job is not None:
+            if not force and now - job.last_progress < 0.25:
+                return
+            job.last_progress = now
+        fraction = None
+        if downloaded is not None and total:
+            fraction = max(0.0, min(1.0, downloaded / total))
+        parts = []
+        if fraction is not None:
+            parts.append(f"{fraction:.0%}")
+        if speed:
+            parts.append(f"{self._format_bytes(speed)}/s")
+        if eta is not None:
+            parts.append(f"ETA {self._format_eta(eta)}")
+        text = "Download Progress: " + " | ".join(parts) if parts else "Download Progress:"
+
+        def apply():
+            if fraction is not None:
+                self.progress_bar.set(fraction)
+            self.progress_label.configure(text=text)
+        self.after(0, apply)
+
+    def _set_progress_header(self, text="Download Progress:"):
+        """Replace the progress header text. Safe from any thread."""
+        self.after(0, lambda: self.progress_label.configure(text=text))
 
     def _build_ytdlp_argv(self, ydl_opts):
         """Translate a ydl_opts dict into CLI args for the external yt-dlp binary.
@@ -800,10 +1172,14 @@ class VideoDownloaderApp(ctk.CTk):
         append what they need.
 
         Note this translation is deliberately partial: only the options below are
-        forwarded, so anything else in ydl_opts is ignored on this path.
+        forwarded, so anything else in ydl_opts is ignored on this path. Keep
+        ARGV_TRANSLATED_OPTS in step with it; a test checks _build_ydl_opts
+        never sets anything outside that set.
         """
-        # Build command line arguments from ydl_opts
-        cmd = [self.ytdlp_exe_path]
+        # Build command line arguments from ydl_opts. Without --encoding the
+        # Windows binary writes the ANSI code page and silently drops every
+        # character that doesn't fit -- a Korean title came through as "()".
+        cmd = [self.ytdlp_exe_path, '--encoding', 'utf-8']
 
         # Add output template
         if 'outtmpl' in ydl_opts:
@@ -848,10 +1224,11 @@ class VideoDownloaderApp(ctk.CTk):
         if 'ffmpeg_location' in ydl_opts:
             cmd.extend(['--ffmpeg-location', ydl_opts['ffmpeg_location']])
 
-        # Add postprocessor args
+        # Add postprocessor args. yt-dlp shlex-splits the value, so it has to be
+        # shlex-joined -- a plain " ".join breaks any argument with a space in it.
         if 'postprocessor_args' in ydl_opts:
             for pp_name, args in ydl_opts['postprocessor_args'].items():
-                cmd.extend(['--postprocessor-args', f'{pp_name}:{" ".join(args)}'])
+                cmd.extend(['--postprocessor-args', f'{pp_name}:{shlex.join(args)}'])
 
         # Add postprocessors
         if 'postprocessors' in ydl_opts:
@@ -869,15 +1246,33 @@ class VideoDownloaderApp(ctk.CTk):
         # Add noplaylist option
         if ydl_opts.get('noplaylist'):
             cmd.append('--no-playlist')
+        if 'playlist_items' in ydl_opts:
+            cmd.extend(['-I', ydl_opts['playlist_items']])
+
+        # Keep going past unavailable playlist items instead of stopping at the first
+        if ydl_opts.get('ignoreerrors') == 'only_download':
+            cmd.append('--no-abort-on-error')
+        elif ydl_opts.get('ignoreerrors'):
+            cmd.append('--ignore-errors')
 
         return cmd
+
+    # Every ydl_opts key the app sets, by where it takes effect. Anything outside
+    # these sets would silently do nothing in the frozen build (see the test).
+    ARGV_TRANSLATED_OPTS = frozenset({
+        'outtmpl', 'format', 'format_sort', 'cookiesfrombrowser', 'cookiefile',
+        'extractor_args', 'js_runtimes', 'remote_components', 'merge_output_format',
+        'ffmpeg_location', 'postprocessor_args', 'postprocessors', 'noplaylist',
+        'playlist_items', 'ignoreerrors',
+    })
+    PROBE_ONLY_OPTS = frozenset({'quiet', 'no_warnings', 'extract_flat'})
 
     def _have_ytdlp_exe(self):
         """True if the auto-updated external engine is available to run."""
         exe = getattr(self, 'ytdlp_exe_path', None)
         return bool(exe) and os.path.exists(exe)
 
-    def _probe_with_exe(self, ydl_opts, url):
+    def _probe_with_exe(self, ydl_opts, url, job=None):
         """Pre-scan a URL with the external (auto-updated) engine.
 
         The probe used to always run through the yt-dlp library frozen into the
@@ -892,108 +1287,118 @@ class VideoDownloaderApp(ctk.CTk):
         cmd = self._build_ytdlp_argv(ydl_opts)
         cmd.extend(['-J', '--flat-playlist', '--no-warnings', url])
 
-        creationflags = subprocess.CREATE_NO_WINDOW if sys.platform == 'win32' else 0
-        result = subprocess.run(cmd, capture_output=True, text=True,
-                                timeout=120, creationflags=creationflags)
-        if result.returncode != 0:
-            detail = (result.stderr or '').strip().splitlines()
-            detail = [ln for ln in detail if ln.lower().startswith(('error:', 'warning:'))]
-            raise Exception("\n".join(detail[-5:]).strip()
-                            or f"yt-dlp probe failed with return code {result.returncode}")
-        return json.loads(result.stdout)
-
-    def _run_ytdlp_subprocess(self, ydl_opts, url):
-        """Run yt-dlp using external executable via subprocess"""
-        cmd = self._build_ytdlp_argv(ydl_opts)
-
-        # Add progress reporting
-        cmd.append('--newline')
-        cmd.append('--progress')
-
-        # Add URL
-        cmd.append(url)
-
-        # Track the last downloaded file path from output
-        last_filepath = None
-        last_error_lines = []
-
-        # Run the command
-        creationflags = subprocess.CREATE_NO_WINDOW if sys.platform == 'win32' else 0
-        process = subprocess.Popen(
-            cmd,
-            stdout=subprocess.PIPE,
-            stderr=subprocess.STDOUT,
-            universal_newlines=True,
-            creationflags=creationflags
-        )
-
-        # Read output and update progress
-        for line in process.stdout:
-            line = line.strip()
-            if line and (
-                line.lower().startswith(('error:', 'warning:'))
-                or self._is_auth_error(line)
-                or self._is_js_challenge_error(line)
-            ):
-                last_error_lines.append(line)
-                last_error_lines = last_error_lines[-5:]
-            if '[download]' in line:
-                # Parse progress from output
-                if '%' in line:
-                    try:
-                        # Extract percentage
-                        parts = line.split()
-                        for i, part in enumerate(parts):
-                            if '%' in part:
-                                percent_str = part
-                                percent = float(percent_str.replace('%', '')) / 100.0
-
-                                # Thread-safe progress update
-                                self.after(0, lambda p=percent: self.progress_bar.set(p))
-
-                                # Try to get speed and ETA
-                                status_msg = f"Downloading: {percent_str}"
-                                if i + 2 < len(parts) and 'iB/s' in parts[i + 2]:
-                                    status_msg += f" | Speed: {parts[i + 2]}"
-                                if 'ETA' in line:
-                                    eta_idx = parts.index('ETA')
-                                    if eta_idx + 1 < len(parts):
-                                        status_msg += f" | ETA: {parts[eta_idx + 1]}"
-
-                                # Thread-safe status update
-                                self.after(0, lambda msg=status_msg: self.update_status(msg, append=False))
-                                break
-                    except Exception:
-                        pass
-                elif 'Destination:' in line:
-                    # Capture the file path from "Destination: /path/to/file"
-                    dest_match = line.split('Destination:', 1)
-                    if len(dest_match) > 1:
-                        last_filepath = dest_match[1].strip()
-                    self.after(0, lambda l=line: self.update_status(l, append=False))
-                elif 'has already been downloaded' in line:
-                    self.after(0, lambda l=line: self.update_status(l, append=False))
-            elif line:
-                # Show other important messages
-                if 'Extracting' in line or 'Merging' in line or 'Converting' in line:
-                    # Thread-safe status update
-                    self.after(0, lambda l=line: self.update_status(l, append=False))
-
-        process.wait()
-
+        process = self._popen_for_job(job, cmd, stdout=subprocess.PIPE, stderr=subprocess.PIPE,
+                                      stdin=subprocess.DEVNULL, encoding='utf-8', errors='replace')
+        try:
+            stdout, stderr = process.communicate(timeout=120)
+        except subprocess.TimeoutExpired:
+            self._kill_process_tree(process)
+            process.communicate()
+            raise Exception("yt-dlp took too long to read this URL")
+        finally:
+            if job is not None:
+                job.process = None
+        self._raise_if_cancelled(job)
         if process.returncode != 0:
-            error_detail = "\n".join(last_error_lines).strip()
-            if error_detail:
-                raise Exception(error_detail)
-            raise Exception(f"yt-dlp failed with return code {process.returncode}")
+            raise Exception(self._error_detail((stderr or '').splitlines())
+                            or f"yt-dlp probe failed with return code {process.returncode}")
+        return json.loads(stdout)
 
-        # Return result with actual file path if captured
-        result = {'title': 'Downloaded'}
-        if last_filepath:
-            result['requested_downloads'] = [{'filepath': last_filepath}]
-        return result
+    @staticmethod
+    def _error_detail(lines):
+        """The text a failure is judged by: yt-dlp's ERROR lines, newest last.
 
-    def show_update_dialog(self, new_version, download_url, release_notes):
+        WARNING lines used to be mixed in, so a harmless JS-challenge or cookie
+        warning could steer an unrelated failure into the wrong advice. They are
+        only used when there is no ERROR line at all.
+        """
+        lines = [ln.strip() for ln in lines if ln.strip()]
+        errors = [ln for ln in lines if ln.lower().startswith('error:')]
+        if errors:
+            return "\n".join(errors[-5:])
+        warnings = [ln for ln in lines if ln.lower().startswith('warning:')]
+        return "\n".join(warnings[-3:])
+
+    @staticmethod
+    def _reported_path(line):
+        """A file path yt-dlp says it is writing on this output line, if any."""
+        match = re.search(r'Destination: (.+)$', line)
+        if match:
+            return match.group(1).strip()
+        match = re.search(r'Merging formats into "(.+)"$', line)
+        if match:
+            return match.group(1)
+        return None
+
+    def _run_ytdlp_subprocess(self, job, ydl_opts, url):
+        """Run yt-dlp using external executable via subprocess"""
+        # The final path of every finished item, written by yt-dlp itself. The
+        # "Destination:" lines only name intermediate files (the .f137.mp4
+        # fragment before a merge, the source before audio extraction).
+        fd, saved_log = tempfile.mkstemp(prefix='lace-saved-', suffix='.txt')
+        os.close(fd)
+        job.saved_log = saved_log
+
+        cmd = self._build_ytdlp_argv(ydl_opts)
+        cmd += ['--newline', '--progress',
+                '--progress-template', 'download:' + self.PROGRESS_TEMPLATE,
+                # FILE is an output template, so a literal % has to be doubled.
+                '--print-to-file', 'after_move:filepath', saved_log.replace('%', '%%'),
+                url]
+
+        output = []
+        process = self._popen_for_job(job, cmd, stdout=subprocess.PIPE, stderr=subprocess.STDOUT,
+                                      stdin=subprocess.DEVNULL, encoding='utf-8', errors='replace')
+        try:
+            for raw_line in process.stdout:
+                line = raw_line.strip()
+                if not line:
+                    continue
+                progress = self._parse_progress_line(line)
+                if progress is not None:
+                    self._report_progress(job, *progress)
+                    continue
+                output.append(line)
+                del output[:-50]
+                self._show_engine_line(job, line)
+            process.wait()
+        finally:
+            # Never leave yt-dlp (or the ffmpeg it started) running behind us.
+            self._kill_process_tree(process)
+            process.stdout.close()
+            job.process = None
+            job.saved = self._saved_paths(job)
+            job.saved_log = None
+            try:
+                os.remove(saved_log)
+            except OSError:
+                pass
+
+        self._raise_if_cancelled(job)
+        if process.returncode != 0:
+            raise Exception(self._error_detail(output)
+                            or f"yt-dlp failed with return code {process.returncode}")
+
+    def _show_engine_line(self, job, line):
+        """Track and display one line of the external engine's output."""
+        path = self._reported_path(line)
+        if path:
+            job.paths.add(path)
+        low = line.lower()
+        if low.startswith('error:'):
+            # A whole-playlist run keeps going past a bad item; say which one.
+            if job.expected > 1:
+                self.after(0, lambda l=line: self.update_status(l))
+            return
+        if path and ('[Merger]' in line or '[VideoConvertor]' in line):
+            self._set_progress_header("Download Progress: so close! Almost done...")
+        if path or 'has already been downloaded' in line or 'Downloading item' in line \
+                or line.startswith(('[ExtractAudio]', '[Merger]', '[VideoConvertor]')):
+            # The folder is already on screen; the log only needs the file name.
+            shown = line.replace(path, os.path.basename(path)) if path else line
+            self.after(0, lambda l=shown: self.update_status(l))
+
+    def show_update_dialog(self, new_version, asset, release_notes):
         """Show dialog asking user if they want to update"""
         message = f"A new version ({new_version}) is available!\n\n"
         message += f"Current version: {self.CURRENT_VERSION}\n\n"
@@ -1010,139 +1415,89 @@ class VideoDownloaderApp(ctk.CTk):
         result = messagebox.askyesno("Omg a potential update!", message)
 
         if result:
-            self.download_and_install_update(download_url)
+            self.download_and_install_update(asset)
 
-    def download_and_install_update(self, download_url):
-        """Download and install the update"""
+    @staticmethod
+    def _writable_dir(path):
+        """True if a file can actually be created in `path`.
+
+        os.access() is unreliable on Windows (Program Files reports writable
+        to it), so try creating a file instead.
+        """
+        try:
+            fd, probe = tempfile.mkstemp(prefix='.write-test-', dir=path)
+            os.close(fd)
+            os.remove(probe)
+            return True
+        except OSError:
+            return False
+
+    def download_and_install_update(self, asset):
+        """Download the release asset, verify it, and put it in place.
+
+        On Windows the running exe is renamed aside (allowed while it runs), the
+        new one moved into its place and started, and this copy exits; the new
+        instance deletes the leftover. That replaces a generated .bat that broke
+        on non-ASCII or %-containing paths and, on failure, sat forever on
+        `pause` in a hidden console.
+        """
+        download_url = asset['browser_download_url']
+        digest = asset.get('digest') or ''
+        expected = digest.split(':', 1)[1] if digest.startswith('sha256:') else None
 
         def download():
-            temp_fd = None
-            temp_path = None
             try:
-                # Show download progress
                 self.after(0, lambda: self.update_status("Downloading update...", append=False))
-
-                # Download the new exe
-                response = requests.get(download_url, stream=True)
-                response.raise_for_status()
-                total_size = int(response.headers.get('content-length', 0))
-
-                # Get current exe path
-                if getattr(sys, 'frozen', False):
-                    current_exe = os.path.abspath(sys.executable)
-                else:
-                    current_exe = os.path.abspath(__file__)
-
+                current_exe = os.path.abspath(sys.executable)
                 current_dir = os.path.dirname(current_exe)
-                # The Linux build is an extensionless ELF, so the ".exe" here was
-                # producing a file the user could neither run nor recognise.
+                in_place = self._writable_dir(current_dir)
+                target_dir = current_dir if in_place else str(Path.home() / 'Downloads')
+                os.makedirs(target_dir, exist_ok=True)
+
+                last = [0.0]
+
+                def on_progress(fraction):
+                    now = time.monotonic()
+                    if now - last[0] >= 0.25:
+                        last[0] = now
+                        self.after(0, lambda p=fraction: self.update_status(
+                            f"Downloading update: {p:.0%}", append=False))
+
+                temp_path = self._download_to(download_url, target_dir, expected,
+                                              min_size=1_000_000, timeout=60,
+                                              on_progress=on_progress)
+                if sys.platform != 'win32':
+                    os.chmod(temp_path, 0o755)
+
+                if sys.platform == 'win32' and in_place:
+                    self._swap_in(temp_path, current_exe)
+                    subprocess.Popen([current_exe], cwd=current_dir, env=self._child_env(),
+                                     creationflags=subprocess.DETACHED_PROCESS)
+                    self.after(0, lambda: self.update_status(
+                        "Update installed! Restarting...", append=False))
+                    self.after(500, self.on_close)
+                    return
+
+                # Linux/macOS, or a Windows install we can't write to: leave the
+                # new build next to the user and say how to finish.
                 suffix = '.exe' if sys.platform == 'win32' else ''
-                # A Linux install can easily sit somewhere unwritable (/opt,
-                # /usr/local/bin). Windows keeps the old behaviour because its
-                # installer script rewrites current_exe in place regardless.
-                if sys.platform != 'win32' and not os.access(current_dir, os.W_OK):
-                    current_dir = str(Path.home() / 'Downloads')
-                    os.makedirs(current_dir, exist_ok=True)
-                final_path = os.path.join(current_dir, f'LacesTotalMediaDownloader_new{suffix}')
-
-                # Download to a temp file first, then rename on success
-                temp_fd, temp_path = tempfile.mkstemp(suffix=suffix + '.tmp', dir=current_dir)
-                os.close(temp_fd)
-                temp_fd = None
-
-                # Download with progress
-                downloaded = 0
-                with open(temp_path, 'wb') as f:
-                    for chunk in response.iter_content(chunk_size=8192):
-                        if chunk:
-                            f.write(chunk)
-                            downloaded += len(chunk)
-                            if total_size > 0:
-                                percent = (downloaded / total_size) * 100
-                                self.after(0, lambda p=percent: self.update_status(f"Downloading update: {p:.1f}%",
-                                                                                   append=False))
-
-                # Verify download completed
-                if total_size > 0 and downloaded != total_size:
-                    raise Exception("Download incomplete - file size mismatch")
-
-                # Verify file exists and has content
-                if not os.path.exists(temp_path) or os.path.getsize(temp_path) < 1000000:
-                    raise Exception("Downloaded file is invalid or too small")
-
-                # Move temp file to final location
-                shutil.move(temp_path, final_path)
-                temp_path = None  # Prevent cleanup since it's been moved
-
-                self.after(0, lambda: self.update_status("Verifying download...", append=False))
-
-                # Create update script
+                final_path = os.path.join(target_dir, f'LacesTotalMediaDownloader_new{suffix}')
+                os.replace(temp_path, final_path)
                 if sys.platform == 'win32':
-                    script_path = os.path.join(current_dir, 'update_installer.bat')
-                    old_exe_backup = os.path.join(current_dir, 'LacesTotalMediaDownloader_old.exe')
-
-                    with open(script_path, 'w') as f:
-                        f.write('@echo off\n')
-                        f.write('echo Waiting for application to close...\n')
-                        f.write('timeout /t 3 /nobreak > nul\n')
-                        f.write('echo Backing up current version...\n')
-                        f.write(f'if exist "{current_exe}" move /Y "{current_exe}" "{old_exe_backup}" 2>nul\n')
-                        f.write('timeout /t 1 /nobreak > nul\n')
-                        f.write('echo Installing update...\n')
-                        f.write(f'move /Y "{final_path}" "{current_exe}"\n')
-                        f.write('if errorlevel 1 (\n')
-                        f.write('    echo Update failed! Restoring backup...\n')
-                        f.write(f'    if exist "{old_exe_backup}" move /Y "{old_exe_backup}" "{current_exe}"\n')
-                        f.write('    echo Update failed. Original version restored.\n')
-                        f.write('    pause\n')
-                        f.write('    exit /b 1\n')
-                        f.write(')\n')
-                        f.write('echo Update complete! Restarting application...\n')
-                        f.write('timeout /t 2 /nobreak > nul\n')
-                        f.write(f'if exist "{old_exe_backup}" del /F /Q "{old_exe_backup}" 2>nul\n')
-                        f.write(f'start "" "{current_exe}"\n')
-                        f.write(f'del "{script_path}"\n')
-
-                    self.after(0, lambda: messagebox.showinfo(
-                        "Update Complete!",
-                        "Update will be installed and the application will restart automatically.\n\nClick OK to continue."
-                    ))
-
-                    subprocess.Popen(
-                        ['cmd.exe', '/c', script_path],
-                        cwd=current_dir,
-                        shell=False,
-                        creationflags=subprocess.CREATE_NO_WINDOW if hasattr(subprocess, 'CREATE_NO_WINDOW') else 0
-                    )
-
-                    import time
-                    time.sleep(0.5)
-
-                    self.after(100, self.destroy)
+                    how = (f"This app's folder can't be written to, so the new version "
+                           f"was saved to:\n{final_path}\n\nClose this app and run that "
+                           f"file instead.")
                 else:
-                    # Downloaded files aren't executable by default on Linux/macOS,
-                    # so the "just run it" instruction below needs this first.
-                    try:
-                        os.chmod(final_path, 0o755)
-                    except OSError:
-                        pass
-                    self.after(0, lambda: messagebox.showinfo(
-                        "Update Downloaded",
-                        f"Update downloaded to:\n{final_path}\n\n"
-                        f"Close this app, then replace the current file:\n"
-                        f"  mv '{final_path}' '{current_exe}'\n\n"
-                        f"and start it again."
-                    ))
+                    how = (f"Update downloaded to:\n{final_path}\n\n"
+                           f"Close this app, then replace the current file:\n"
+                           f"  mv '{final_path}' '{current_exe}'\n\nand start it again.")
+                self.after(0, lambda: messagebox.showinfo("Update Downloaded", how))
 
             except Exception as e:
-                # Clean up temp file on failure
-                if temp_path and os.path.exists(temp_path):
-                    try:
-                        os.remove(temp_path)
-                    except OSError:
-                        pass
-                self.after(0, lambda: messagebox.showerror("Update Failed",
-                                                           f"Failed to download update:\n{str(e)}\n\nPlease download the update manually from GitHub."))
+                self.after(0, lambda err=e: messagebox.showerror(
+                    "Update Failed",
+                    f"Failed to download update:\n{err}\n\n"
+                    "Please download the update manually from GitHub."))
 
         thread = threading.Thread(target=download, daemon=True)
         thread.start()
@@ -1152,8 +1507,11 @@ class VideoDownloaderApp(ctk.CTk):
         try:
             config_path = Path.home() / '.lace_downloader_config.json'
             if config_path.exists():
-                with open(config_path, 'r') as f:
-                    return json.load(f)
+                with open(config_path, 'r', encoding='utf-8') as f:
+                    data = json.load(f)
+                # A hand-edited or damaged file must not stop the app starting.
+                if isinstance(data, dict):
+                    return data
         except Exception:
             pass
         return {}
@@ -1166,10 +1524,13 @@ class VideoDownloaderApp(ctk.CTk):
                 'recent_folders': self.recent_folders,
                 'hires_codec_default': self.hires_codec_default,
                 'ask_hires_codec': self.ask_hires_codec,
-                'prefer_gpu': self.prefer_gpu,
             }
-            with open(config_path, 'w') as f:
+            # Write a sibling file and swap it in, so a crash mid-write can't
+            # leave a truncated config that loses every setting.
+            temp_path = config_path.with_name(config_path.name + '.tmp')
+            with open(temp_path, 'w', encoding='utf-8') as f:
                 json.dump(data, f)
+            os.replace(temp_path, config_path)
         except Exception:
             pass
 
@@ -1201,14 +1562,16 @@ class VideoDownloaderApp(ctk.CTk):
             # Running as script
             base_path = os.path.dirname(os.path.abspath(__file__))
 
-        # Check common local paths
+        # Check common local paths. A frozen build also looks beside the exe,
+        # which is where the "FFmpeg not found" advice tells people to put it.
+        bases = [base_path]
+        if getattr(sys, 'frozen', False):
+            bases.append(os.path.dirname(sys.executable))
         local_paths = [
-            os.path.join(base_path, 'ffmpeg.exe'),
-            os.path.join(base_path, 'ffmpeg', 'ffmpeg.exe'),
-            os.path.join(base_path, 'bin', 'ffmpeg.exe'),
-            os.path.join(base_path, 'ffmpeg'),  # Linux/Mac
-            os.path.join(base_path, 'ffmpeg', 'ffmpeg'),
-            os.path.join(base_path, 'bin', 'ffmpeg'),
+            os.path.join(base, *parts)
+            for base in bases
+            for parts in (('ffmpeg.exe',), ('ffmpeg', 'ffmpeg.exe'), ('bin', 'ffmpeg.exe'),
+                          ('ffmpeg',), ('ffmpeg', 'ffmpeg'), ('bin', 'ffmpeg'))  # Linux/Mac
         ]
 
         for path in local_paths:
@@ -1268,24 +1631,27 @@ class VideoDownloaderApp(ctk.CTk):
         self.hw_encoders as {'h264': encoder, 'hevc': encoder}.
         """
         def probe():
-            if not self.ffmpeg_available or not getattr(self, 'ffmpeg_path', None):
-                return
-            candidates = {
-                'h264': ['h264_nvenc', 'h264_qsv', 'h264_amf'],
-                'hevc': ['hevc_nvenc', 'hevc_qsv', 'hevc_amf'],
-            }
-            found = {}
-            for codec, encoders in candidates.items():
-                for enc in encoders:
-                    if self._test_encoder(enc):
-                        found[codec] = enc
-                        break
-            self.hw_encoders = found
-            if found:
-                msg = "GPU encoder ready: " + ", ".join(sorted(set(found.values())))
-            else:
-                msg = "No GPU encoder available — high-res transcodes will use CPU."
-            self.after(0, lambda m=msg: self.update_status(m))
+            try:
+                if not self.ffmpeg_available or not getattr(self, 'ffmpeg_path', None):
+                    return
+                candidates = {
+                    'h264': ['h264_nvenc', 'h264_qsv', 'h264_amf'],
+                    'hevc': ['hevc_nvenc', 'hevc_qsv', 'hevc_amf'],
+                }
+                found = {}
+                for codec, encoders in candidates.items():
+                    for enc in encoders:
+                        if self._test_encoder(enc):
+                            found[codec] = enc
+                            break
+                self.hw_encoders = found
+                if found:
+                    msg = "GPU encoder ready: " + ", ".join(sorted(set(found.values())))
+                else:
+                    msg = "No GPU encoder found — 4K+ MP4 requests will be saved as MKV."
+                self.after(0, lambda m=msg: self.update_status(m))
+            finally:
+                self._hw_probe_done.set()
 
         threading.Thread(target=probe, daemon=True).start()
 
@@ -1294,12 +1660,11 @@ class VideoDownloaderApp(ctk.CTk):
         using the *same* rate-control flags we'll use for real, so an encoder that
         exists but rejects our settings (e.g. a driver mismatch) is rejected here."""
         try:
-            creationflags = subprocess.CREATE_NO_WINDOW if sys.platform == 'win32' else 0
             result = subprocess.run(
                 [self.ffmpeg_path, '-hide_banner', '-loglevel', 'error',
                  '-f', 'lavfi', '-i', 'color=c=black:s=256x256:d=0.1',
                  '-c:v', encoder] + self._encoder_quality_args(encoder) + ['-f', 'null', '-'],
-                capture_output=True, timeout=25, creationflags=creationflags
+                capture_output=True, timeout=25, creationflags=self._NO_WINDOW
             )
             return result.returncode == 0
         except Exception:
@@ -1328,21 +1693,32 @@ class VideoDownloaderApp(ctk.CTk):
         }
         return list(table.get(encoder, ['-preset', 'fast', '-crf', '18', '-pix_fmt', 'yuv420p']))
 
-    def _video_encoder_args(self, codec, prefer_gpu=None):
-        """Build the FFmpegVideoConvertor postprocessor args for an editor-ready mp4.
+    def _video_encoder_args(self, codec, prefer_gpu=True, container='mp4'):
+        """Build the FFmpegVideoConvertor postprocessor args for an editor-ready file.
 
-        Output is always Premiere-friendly: H.264/HEVC in mp4, 8-bit yuv420p,
-        AAC audio, faststart.  HEVC is tagged hvc1 so Premiere/QuickTime accept it.
+        Output is always Premiere-friendly: H.264/HEVC, 8-bit yuv420p, AAC audio,
+        and for mp4/mov faststart plus an hvc1 tag on HEVC so Premiere/QuickTime
+        accept it. The GPU encoder found at startup is used when there is one.
         """
-        if prefer_gpu is None:
-            prefer_gpu = True
         encoder = self._resolve_encoder(codec, prefer_gpu)
 
         args = ['-c:v', encoder] + self._encoder_quality_args(encoder)
-        if encoder in ('hevc_nvenc', 'hevc_qsv', 'hevc_amf', 'libx265'):
-            args += ['-tag:v', 'hvc1']  # required so Premiere/QuickTime accept HEVC-in-mp4
-        args += ['-c:a', 'aac', '-b:a', '192k', '-movflags', '+faststart']
+        if container in ('mp4', 'mov'):
+            if encoder in ('hevc_nvenc', 'hevc_qsv', 'hevc_amf', 'libx265'):
+                args += ['-tag:v', 'hvc1']  # required so Premiere/QuickTime accept HEVC-in-mp4
+            args += ['-movflags', '+faststart']
+        args += ['-c:a', 'aac', '-b:a', '192k']
         return args
+
+    def _gpu_codec_for(self, target_h):
+        """The codec a GPU can transcode a `target_h` video to, or None.
+
+        Waits briefly for the startup encoder probe, so a download clicked in
+        the app's first second doesn't miss a GPU that is about to be found.
+        """
+        self._hw_probe_done.wait(timeout=15)
+        codec = self._decide_codec(target_h)
+        return codec if self.hw_encoders.get(codec) else None
 
     # ------------------------------------------------------------------ #
     #  Quality / codec / auth helpers                                     #
@@ -1489,14 +1865,6 @@ class VideoDownloaderApp(ctk.CTk):
         # use yt-dlp[default]. This is a fallback for older local environments.
         ydl_opts.setdefault('remote_components', ['ejs:github'])
 
-    def _runtime_download_dir(self):
-        """Folder to drop an auto-downloaded deno into.
-
-        Same per-user location as the yt-dlp engine, so it still works when the
-        app is installed somewhere unwritable.
-        """
-        return self._engine_dir()
-
     @staticmethod
     def _deno_download_url():
         """Latest-release Deno asset URL for this platform (zip archive)."""
@@ -1523,44 +1891,52 @@ class VideoDownloaderApp(ctk.CTk):
             if self._get_js_runtime_args():
                 return
 
+            # Same per-user folder as the yt-dlp engine, so it still works when
+            # the app is installed somewhere unwritable.
+            engine_dir = self._engine_dir()
             deno_name = 'deno.exe' if sys.platform == 'win32' else 'deno'
-            deno_path = os.path.join(self._runtime_download_dir(), deno_name)
+            deno_path = os.path.join(engine_dir, deno_name)
             if os.path.exists(deno_path):
                 return
 
-            import io
             import zipfile
-            temp_path = deno_path + '.tmp'
+            archive_path = temp_path = None
             try:
                 self.after(0, lambda: self.update_status(
                     "Setting up YouTube support (one-time Deno download)..."))
-                resp = requests.get(self._deno_download_url(), timeout=180)
-                resp.raise_for_status()
-                with zipfile.ZipFile(io.BytesIO(resp.content)) as z:
+                url = self._deno_download_url()
+                expected = self._parse_sha256(self._fetch_text(url + '.sha256sum'))
+                # Streamed to disk: the archive and binary together are ~150 MB.
+                archive_path = self._download_to(url, engine_dir, expected,
+                                                 min_size=10_000_000, timeout=180)
+                with zipfile.ZipFile(archive_path) as z:
                     member = next((n for n in z.namelist()
                                    if os.path.basename(n) in ('deno.exe', 'deno')), None)
                     if not member:
                         raise Exception("deno binary not found in the downloaded archive")
-                    data = z.read(member)
-                if len(data) < 20_000_000:  # deno is ~95 MB; guard against a bad download
+                    fd, temp_path = tempfile.mkstemp(prefix='.deno-', suffix='.tmp', dir=engine_dir)
+                    with os.fdopen(fd, 'wb') as out, z.open(member) as src:
+                        shutil.copyfileobj(src, out, 1 << 20)
+                if os.path.getsize(temp_path) < 20_000_000:  # deno is ~95 MB
                     raise Exception("downloaded Deno looks too small / corrupt")
-                with open(temp_path, 'wb') as f:
-                    f.write(data)
                 if sys.platform != 'win32':
                     os.chmod(temp_path, 0o755)
                 os.replace(temp_path, deno_path)
-                self.after(0, lambda: self.update_status(
-                    "YouTube support ready (Deno installed)."))
+                temp_path = None
+                verified = "checksum verified" if expected else "no checksum published"
+                self.after(0, lambda c=verified: self.update_status(
+                    f"YouTube support ready (Deno installed, {c})."))
             except Exception as e:
                 self.after(0, lambda err=e: self.update_status(
                     f"Couldn't set up Deno automatically: {err}\n"
                     "YouTube may still work; if not, install Deno or Node.js 22+ and restart."))
             finally:
-                if os.path.exists(temp_path):
-                    try:
-                        os.remove(temp_path)
-                    except OSError:
-                        pass
+                for leftover in (archive_path, temp_path):
+                    if leftover and os.path.exists(leftover):
+                        try:
+                            os.remove(leftover)
+                        except OSError:
+                            pass
 
         threading.Thread(target=work, daemon=True).start()
 
@@ -1947,10 +2323,13 @@ class VideoDownloaderApp(ctk.CTk):
     def _auth_reason(error_msg):
         """One-line explanation of why the site wants a signed-in account."""
         low = str(error_msg or '').lower()
-        if 'age' in low or 'inappropriate' in low:
-            return "This video is age-restricted."
+        # Checked before the age phrases, and those are matched whole: a bare
+        # 'age' also hits "webpage" and "message".
         if 'not a bot' in low:
             return "YouTube wants to confirm you're not a bot."
+        if any(s in low for s in ('confirm your age', 'age-restricted', 'age restricted',
+                                  'inappropriate')):
+            return "This video is age-restricted."
         if 'members' in low or 'join this channel' in low:
             return "This video is for channel members only."
         if 'private' in low:
@@ -2139,7 +2518,7 @@ class VideoDownloaderApp(ctk.CTk):
         argv = [exe, url] if exe else self._flatpak_browser_argv(browser, url)
         if argv:
             try:
-                subprocess.Popen(argv)
+                subprocess.Popen(argv, env=self._child_env())
                 return
             except Exception:
                 pass
@@ -2203,7 +2582,11 @@ class VideoDownloaderApp(ctk.CTk):
                 jar = YoutubeDLCookieJar(self.cookies_file)
                 jar.load()
             else:
-                jar = extract_cookies_from_browser(source, logger=self._QuietCookieLogger())
+                # Same profile the download will use -- without it a Flatpak or
+                # Snap browser failed this check yet would have downloaded fine.
+                jar = extract_cookies_from_browser(
+                    source, self._browser_profile_dir(source),
+                    logger=self._QuietCookieLogger())
         except Exception as e:
             return False, self._cookie_problem_message(source, e)
 
@@ -2213,14 +2596,15 @@ class VideoDownloaderApp(ctk.CTk):
                            f"Retry Download.")
         return True, ''
 
-    def _use_signin_source(self, url, source, dialog=None, on_problem=None):
+    def _use_signin_source(self, url, source, dialog=None, on_problem=None, verified=None):
         """Switch to `source` and restart the download for `url` with it.
 
         Returns True when the retry actually started. A source we can't read is
         reported through `on_problem` and left unset, so the download is never
-        retried with cookies that are already known to fail.
+        retried with cookies that are already known to fail. `verified` is an
+        (ok, problem) result the dialog already got from a worker thread.
         """
-        ok, problem = self._verify_cookie_source(source)
+        ok, problem = verified if verified is not None else self._verify_cookie_source(source)
         if not ok:
             if on_problem:
                 on_problem(problem)
@@ -2415,19 +2799,31 @@ class VideoDownloaderApp(ctk.CTk):
                 return
             status.configure(text=f"Checking your {self._browser_label(src)} sign-in...")
             retry_btn.configure(state="disabled")
-            dialog.update_idletasks()
-            started = self._use_signin_source(
-                url, src, dialog=dialog,
-                on_problem=lambda msg: status.configure(text=msg))
-            if started:
-                self._signin_dialog = None
-            else:
-                retry_btn.configure(state="normal")
+
+            # Reading a browser's cookies can mean decrypting them or waiting on
+            # a keyring prompt, so it happens off the Tk thread.
+            def check():
+                result = self._verify_cookie_source(src)
+                self.after(0, lambda: finish(result))
+
+            def finish(result):
+                if self._signin_dialog is not dialog:
+                    return  # cancelled while we were checking
+                started = self._use_signin_source(
+                    url, src, dialog=dialog, verified=result,
+                    on_problem=lambda msg: status.configure(text=msg))
+                if started:
+                    self._signin_dialog = None
+                else:
+                    retry_btn.configure(state="normal")
+
+            threading.Thread(target=check, daemon=True).start()
 
         def cancel():
             self._signin_dialog = None
             dialog.destroy()
             self.update_status("Download cancelled — this video needs a YouTube sign-in.")
+            self._end_download(self._job)
 
         row2 = ctk.CTkFrame(dialog, fg_color=self.colors['bg'])
         row2.pack(fill="x", side="bottom", padx=24, pady=(18, 20))
@@ -2445,12 +2841,17 @@ class VideoDownloaderApp(ctk.CTk):
         dialog.after(120, dialog.grab_set)  # modal once the window exists
 
     def _restart_download(self, url):
-        """Re-run a download for `url` (used after the user signs in)."""
-        self.is_downloading = True
-        self.download_btn.configure(state="disabled", text="Downloading...")
+        """Re-run a download for `url` (used after the user signs in).
+
+        Continues the job the sign-in dialog was holding open, with the settings
+        from the original click.
+        """
+        job = self._job
+        if job is None or job.url != url:
+            job = self._begin_job(url, self._snapshot_settings())
         self.progress_bar.set(0)
         self.update_status("Retrying with your YouTube sign-in...", append=False)
-        threading.Thread(target=self.download_media, args=(url,), daemon=True).start()
+        self._start_worker(job, self.download_media)
 
     def browse_folder(self):
         folder = filedialog.askdirectory()
@@ -2468,6 +2869,12 @@ class VideoDownloaderApp(ctk.CTk):
                 display = folder
                 if len(display) > 40:
                     display = "..." + display[-37:]
+                # Two long paths can end in the same 37 characters; number the
+                # repeats so each label still maps to its own folder.
+                base, n = display, 2
+                while display in display_paths:
+                    display = f"{base} ({n})"
+                    n += 1
                 display_paths.append(display)
 
             # Store mapping from display string to full path
@@ -2487,15 +2894,21 @@ class VideoDownloaderApp(ctk.CTk):
             if full_path:
                 self.output_folder.set(full_path)
 
-    def open_folder(self, path):
-        """Open folder in file explorer (cross-platform)"""
+    def open_folder(self, path, select=None):
+        """Open a folder in the file manager, highlighting `select` where supported."""
         try:
             if sys.platform == 'win32':
-                os.startfile(path)
+                if select and os.path.exists(select):
+                    # Explorer parses its own command line; this exact quoting
+                    # is the form it accepts for paths with spaces.
+                    subprocess.Popen(f'explorer /select,"{os.path.normpath(select)}"')
+                else:
+                    os.startfile(path)
             elif sys.platform == 'darwin':  # macOS
-                subprocess.run(['open', path])
+                subprocess.Popen(['open', '-R', select] if select and os.path.exists(select)
+                                 else ['open', path])
             else:  # Linux
-                subprocess.run(['xdg-open', path])
+                subprocess.Popen(['xdg-open', path], env=self._child_env())
         except Exception as e:
             messagebox.showerror("Error", f"Could not open folder: {str(e)}")
 
@@ -2515,7 +2928,7 @@ class VideoDownloaderApp(ctk.CTk):
         except Exception:
             pass
 
-    def show_completion_dialog(self):
+    def show_completion_dialog(self, folder, saved=()):
         """Show completion dialog and ask if user wants to open folder"""
         # Play notification sound
         self.play_notification_sound()
@@ -2528,7 +2941,8 @@ class VideoDownloaderApp(ctk.CTk):
         )
 
         if result:
-            self.open_folder(self.output_folder.get())
+            # One file: open its folder with it highlighted.
+            self.open_folder(folder, select=saved[0] if len(saved) == 1 else None)
 
     def update_status(self, message, append=True):
         self.status_text.configure(state="normal")
@@ -2543,45 +2957,62 @@ class VideoDownloaderApp(ctk.CTk):
         self.status_text.see("end")
         self.status_text.configure(state="disabled")
 
-    def progress_hook(self, d):
-        """Called from yt-dlp worker thread — schedule all UI updates on the main thread."""
-        if d['status'] == 'downloading':
-            try:
-                percent_str = d.get('_percent_str', '0%').strip()
-                percent = float(percent_str.replace('%', '')) / 100.0
+    def progress_hook(self, d, job=None):
+        """Called from yt-dlp worker thread — schedule all UI updates on the main thread.
 
-                speed = d.get('_speed_str', 'N/A')
-                eta = d.get('_eta_str', 'N/A')
-                downloaded = d.get('_downloaded_bytes_str', 'N/A')
-                total = d.get('_total_bytes_str', 'N/A')
+        Works from the raw byte counts: the preformatted _percent_str can be
+        "N/A" or carry colour codes, which made the old float() parse fail
+        silently and the bar never move.
+        """
+        if d.get('status') == 'downloading':
+            total = d.get('total_bytes') or d.get('total_bytes_estimate')
+            self._report_progress(job, d.get('downloaded_bytes'), total,
+                                  d.get('speed'), d.get('eta'))
+        elif d.get('status') == 'finished':
+            self._report_progress(job, 1, 1, None, None, force=True)
+            self._set_progress_header("Download Progress: so close! Almost done...")
 
-                status_msg = f"Downloading: {percent_str} ({downloaded}/{total})\n"
-                status_msg += f"Speed: {speed} | ETA: {eta}"
+    def _snapshot_settings(self):
+        """Every UI choice, read once on the Tk thread when DOWNLOAD is clicked.
 
-                # Thread-safe UI updates via self.after
-                self.after(0, lambda p=percent: self.progress_bar.set(p))
-                self.after(0, lambda msg=status_msg: self.update_status(msg, append=False))
-            except Exception:
-                pass
-        elif d['status'] == 'finished':
-            self.after(0, lambda: self.progress_bar.set(1.0))
-            self.after(0, lambda: self.update_status("So Close! Almost done...", append=False))
+        Workers used to read the Tk variables themselves -- from the wrong
+        thread, and after a dialog, so a dropdown changed in the meantime
+        changed what was downloaded.
+        """
+        return {
+            'output_folder': self.output_folder.get().strip(),
+            'download_type': self.download_type.get(),
+            'quality': self.quality.get(),
+            'audio_quality': self.audio_quality.get(),
+            'video_format': self.video_format.get(),
+            'audio_format': self.audio_format.get(),
+        }
 
-    def _build_ydl_opts(self, noplaylist, target_height=None, url=None):
-        """Build yt-dlp options dict from the current UI settings.
+    def _build_ydl_opts(self, settings, noplaylist, target_height=None, url=None,
+                        playlist_all=False, single_item=False, prefer_gpu=True):
+        """Build yt-dlp options dict from a settings snapshot.
 
         Shared by download_media() and download_with_playlist_choice() so that
         format / postprocessor logic is defined in exactly one place.
 
         target_height is the resolved/probed height of the video (used to decide
-        whether a high-res mp4 request should be saved as mkv instead). None
+        whether a high-res mp4 request needs a GPU transcode or an mkv). None
         means "Best / unknown" and is treated as high-res.
+
+        playlist_all keeps going past unavailable items; single_item limits a
+        playlist URL to its first entry (noplaylist alone only does that for
+        watch?v=...&list=... URLs, not /playlist ones). prefer_gpu=False is the
+        retry after a GPU encode failed.
         """
-        output_template = os.path.join(self.output_folder.get(), "%(title)s.%(ext)s")
+        output_template = os.path.join(settings['output_folder'], "%(title)s.%(ext)s")
         ydl_opts = {
             'outtmpl': output_template,
             'noplaylist': noplaylist,
         }
+        if playlist_all:
+            ydl_opts['ignoreerrors'] = 'only_download'
+        if single_item:
+            ydl_opts['playlist_items'] = '1'
 
         # Attach cookies + bot/age-gate resilience
         self._apply_auth_opts(ydl_opts, url)
@@ -2590,14 +3021,14 @@ class VideoDownloaderApp(ctk.CTk):
         if self.ffmpeg_available and self.ffmpeg_path:
             ydl_opts['ffmpeg_location'] = os.path.dirname(self.ffmpeg_path)
 
-        if self.download_type.get() == "video":
-            quality = self.quality.get()
-            video_format = self.video_format.get()
+        if settings['download_type'] == "video":
+            quality = settings['quality']
+            video_format = settings['video_format']
             cap = self._quality_to_height(quality)  # None == Best (no cap)
             # Effective height: prefer the probed value when we have it.
             eff_h = cap if target_height is None else target_height
             # YouTube only serves H.264 up to 1080p; anything taller is usually
-            # VP9/AV1. Instead of slow MP4 transcoding, save those as MKV.
+            # VP9/AV1, which needs a transcode for MP4 (GPU) or an MKV (no GPU).
             needs_mkv_fallback = (eff_h is None) or (eff_h > 1080)
 
             if self.ffmpeg_available:
@@ -2613,9 +3044,24 @@ class VideoDownloaderApp(ctk.CTk):
                                           f'best[height<={cap}]')
 
                 if video_format == 'mp4':
-                    if needs_mkv_fallback:
-                        # 4K+ YouTube streams are commonly VP9/AV1. Muxing to MKV
-                        # keeps the original quality and avoids a long transcode.
+                    gpu_codec = (self._gpu_codec_for(eff_h)
+                                 if needs_mkv_fallback and prefer_gpu else None)
+                    if gpu_codec:
+                        # Measured ~6-9x faster than the CPU encoders on 4K, which
+                        # is what makes a real MP4 practical here. SDR is preferred
+                        # because the 8-bit output would wash out an HDR source.
+                        ydl_opts['format_sort'] = ['res', '+hdr', 'vcodec:h264', 'acodec:aac']
+                        ydl_opts['merge_output_format'] = 'mkv'
+                        ydl_opts['postprocessors'] = [{
+                            'key': 'FFmpegVideoConvertor', 'preferedformat': 'mp4'}]
+                        ydl_opts['postprocessor_args'] = {
+                            'videoconvertor': self._video_encoder_args(gpu_codec)}
+                        self.after(0, lambda: self.update_status(
+                            "High-res video will be converted to MP4 on your GPU."))
+                    elif needs_mkv_fallback:
+                        # 4K+ YouTube streams are commonly VP9/AV1. Without a GPU,
+                        # muxing to MKV keeps the original quality and avoids a
+                        # very long CPU transcode.
                         ydl_opts['merge_output_format'] = 'mkv'
                         self.after(0, lambda: self.update_status(
                             "High-res video will be saved as MKV to avoid a slow MP4 conversion."))
@@ -2632,6 +3078,16 @@ class VideoDownloaderApp(ctk.CTk):
                         'key': 'FFmpegVideoConvertor',
                         'preferedformat': video_format,  # Note: yt-dlp uses 'prefered' (one r)
                     }]
+                    if video_format in ('mov', 'flv'):
+                        # This is a full re-encode either way, so use the GPU when
+                        # there is one. FLV gets H.264 instead of ffmpeg's default
+                        # Sorenson flv1, which looks poor at modern resolutions.
+                        # AVI keeps yt-dlp's Xvid: no GPU encodes MPEG-4 Part 2.
+                        self._hw_probe_done.wait(timeout=15)
+                        codec = 'h264' if video_format == 'flv' else self._decide_codec(eff_h)
+                        ydl_opts['postprocessor_args'] = {
+                            'videoconvertor': self._video_encoder_args(
+                                codec, prefer_gpu, container=video_format)}
             else:
                 # Without ffmpeg, download pre-merged formats only
                 if cap is None:
@@ -2641,11 +3097,11 @@ class VideoDownloaderApp(ctk.CTk):
                 self.after(0, lambda: self.update_status(
                     "Note: Without ffmpeg, using pre-merged format (may have lower quality)"))
         else:
-            audio_format = self.audio_format.get()
+            audio_format = settings['audio_format']
 
             if self.ffmpeg_available:
                 # With ffmpeg, extract and convert to chosen format
-                bitrate = self.audio_quality.get().split()[0]
+                bitrate = settings['audio_quality'].split()[0]
                 ydl_opts['format'] = 'bestaudio/best'
 
                 # Map format names to codec names
@@ -2674,27 +3130,60 @@ class VideoDownloaderApp(ctk.CTk):
 
         return ydl_opts
 
-    def _run_download_and_finish(self, ydl_opts, url, success_message):
-        """Run the download with the given options and handle result / errors.
+    def _uses_gpu_encoder(self, ydl_opts):
+        """True if these options transcode with one of the detected GPU encoders."""
+        args = (ydl_opts.get('postprocessor_args') or {}).get('videoconvertor') or []
+        return any(enc in args for enc in self.hw_encoders.values())
 
-        Shared by download_media() and download_with_playlist_choice().
+    @staticmethod
+    def _is_conversion_error(error_msg):
+        low = error_msg.lower()
+        return 'postprocessing' in low or 'conversion failed' in low
+
+    def _run_download_and_finish(self, job, build_opts, success_message, playlist_all=False):
+        """Run the download and report the result. Errors propagate to _run_job.
+
+        `build_opts(prefer_gpu)` returns the yt-dlp options. If a GPU transcode
+        fails (a driver hiccup), the same job runs once more with prefer_gpu
+        False: yt-dlp finds the already-downloaded file and only redoes the
+        conversion. Shared by download_media() and download_with_playlist_choice().
         Must be called from a worker thread.
         """
+        folder = job.settings['output_folder']
         self.after(0, lambda: self.update_status("Download starting..."))
 
         # Add folder to recent list (touches the dropdown — must run on main thread)
-        self.after(0, lambda: self.add_recent_folder(self.output_folder.get()))
+        self.after(0, lambda: self.add_recent_folder(folder))
 
-        result = self.run_ytdlp_download(ydl_opts, url)
-        # Try to get the filename
-        if 'requested_downloads' in result and result['requested_downloads']:
-            self.downloaded_file_path = result['requested_downloads'][0].get('filepath')
+        ydl_opts = build_opts(True)
+        partial_error = None
+        try:
+            self.run_ytdlp_download(job, ydl_opts, job.url)
+        except DownloadCancelledError:
+            raise
+        except Exception as e:
+            if self._uses_gpu_encoder(ydl_opts) and self._is_conversion_error(str(e)):
+                self.after(0, lambda: self.update_status(
+                    "GPU encoding failed; finishing on the CPU instead..."))
+                self.run_ytdlp_download(job, build_opts(False), job.url)
+            elif playlist_all and job.saved:
+                # Some items saved, some didn't (private, removed, region-locked).
+                partial_error = e
+            else:
+                raise
 
-        self.after(0, lambda: self.update_status(success_message))
+        saved = list(dict.fromkeys(job.saved))
+        missing = job.expected - len(saved) if playlist_all else 0
+        if missing > 0 or partial_error is not None:
+            message = (f"Downloaded {len(saved)} of {job.expected} items. "
+                       f"{max(missing, 1)} couldn't be downloaded; their errors are listed above.")
+        else:
+            message = success_message
+        self.after(0, lambda: self.update_status(message))
         self.after(0, lambda: self.progress_bar.set(1))
 
         # Show completion dialog
-        self.after(100, self.show_completion_dialog)
+        self.after(100, lambda: self.show_completion_dialog(folder, saved))
 
     # Signs that a site changed its pages and the extractor hasn't caught up.
     # These are the errors a fresh engine fixes, so they get the same advice.
@@ -2731,14 +3220,18 @@ class VideoDownloaderApp(ctk.CTk):
         )
 
     def _handle_download_error(self, e, url=None):
-        """Format and display a download error. Must be called from a worker thread."""
+        """Format and display a download error. Must be called from a worker thread.
+
+        Returns True when the job was handed to the sign-in dialog instead, which
+        then finishes or retries it.
+        """
         error_msg = str(e)
 
         # Sign-in / age / bot / members wall (and unreadable cookie stores): keep
         # these out of the status box and route them through the sign-in dialog.
         if self._route_auth_failure(url, error_msg):
             self.after(0, lambda: self.progress_bar.set(0))
-            return
+            return True
 
         handled = False
 
@@ -2792,96 +3285,173 @@ class VideoDownloaderApp(ctk.CTk):
 
         self.after(0, lambda: self.update_status(f"Error: {error_msg}"))
         self.after(0, lambda: self.progress_bar.set(0))
+        return False
 
-    def download_media(self, url):
+    # ------------------------------------------------------------------ #
+    #  Download jobs: start, hand-off between dialogs, cancel, finish     #
+    # ------------------------------------------------------------------ #
+    def _begin_job(self, url, settings):
+        """Make `url` the job in flight and turn DOWNLOAD into Cancel (Tk thread)."""
+        job = DownloadJob(url, settings)
+        self._job = job
+        self.is_downloading = True
+        self.download_btn.configure(state="normal", text="CANCEL", command=self.cancel_download)
+        return job
+
+    def _end_download(self, job):
+        """Finish `job` and restore the DOWNLOAD button (Tk thread).
+
+        The single place a job ends. Every path that finishes one calls it, so it
+        ignores a job that has already ended. The old code reset the button in
+        each worker's `finally` -- including workers that had only handed the job
+        to a dialog -- which left DOWNLOAD live during playlist and 4K downloads.
+        """
+        if job is None or self._job is not job:
+            return
+        self._job = None
+        self.is_downloading = False
+        self.download_btn.configure(state="normal", text="DOWNLOAD", command=self.start_download)
+        self.progress_label.configure(text="Download Progress:")
+
+    def cancel_download(self):
+        """Stop the job in flight: kill yt-dlp and its ffmpeg, then clean up."""
+        job = self._job
+        if job is None or job.cancel.is_set():
+            return
+        job.cancel.set()
+        self.download_btn.configure(state="disabled", text="Cancelling...")
+        self.update_status("Cancelling...")
+        # taskkill can take a moment; the worker notices the dead process and
+        # finishes the job itself.
+        threading.Thread(target=self._kill_process_tree, args=(job.process,),
+                         daemon=True).start()
+
+    def _start_worker(self, job, work, *args):
+        threading.Thread(target=self._run_job, args=(job, work) + args, daemon=True).start()
+
+    def _run_job(self, job, work, *args):
+        """Run one stage of `job` on this worker thread.
+
+        `work` returns True when it handed the job to a dialog, which then owns
+        it; otherwise the job ends here, however `work` finished.
+        """
+        handed_off = False
         try:
-            self._await_engine()
-            self.after(0, lambda: self.update_status(f"Peeping that URL: {url}", append=False))
-
-            # Pre-scan: detect playlists and (for single videos) the max available
-            # resolution.  extract_flat='in_playlist' keeps playlist scans fast while
-            # still returning full formats for a single video.
-            ydl_opts_check = {
-                'quiet': True,
-                'no_warnings': True,
-                'extract_flat': 'in_playlist',
-            }
-            self._apply_auth_opts(ydl_opts_check, url)
-
-            info = None
-            is_playlist = False
-            try:
-                # Prefer the auto-updated engine: extraction is the part that
-                # breaks when a site changes, so probing with the frozen-in
-                # library would reintroduce the staleness we just fixed.
-                if getattr(sys, 'frozen', False) and self._have_ytdlp_exe():
-                    info = self._probe_with_exe(ydl_opts_check, url)
-                else:
-                    with yt_dlp.YoutubeDL(ydl_opts_check) as ydl:
-                        info = ydl.extract_info(url, download=False)
-                is_playlist = bool(info) and 'entries' in info
-            except Exception as pre_e:
-                pre_error_msg = str(pre_e)
-                # If this looks like a sign-in wall, offer the sign-in popup
-                # instead of failing. Capture the text now; Python clears
-                # exception variables before delayed Tk callbacks run.
-                if self._route_auth_failure(url, pre_error_msg):
-                    return
-                # Otherwise (network/other) don't abort — fall back to a single-item
-                # download with the fresh engine, which may still succeed.
-                self.after(0, lambda: self.update_status(
-                    "Couldn't pre-scan the URL; trying as a single download..."))
-
-            # Handle playlist - always ask user
-            if is_playlist:
-                playlist_title = info.get('title', 'Unknown Playlist')
-                entry_count = len(list(info.get('entries', [])))
-
-                self.after(0, lambda: self.update_status(
-                    f"Playlist detected: '{playlist_title}' ({entry_count} items)"))
-
-                # Ask user in a dialog
-                self.after(0, lambda: self.ask_playlist_download(url, playlist_title, entry_count))
-                return
-
-            # Single video: work out the target height so we can warn when a
-            # high-res mp4 request will be saved as mkv to avoid conversion.
-            # target_h is None when we couldn't determine it (Best on a URL we
-            # failed to pre-scan) — treated downstream as high-res.
-            cap = self._quality_to_height(self.quality.get())
-            max_h = 0
-            if info and info.get('formats'):
-                try:
-                    max_h = max((f.get('height') or 0) for f in info['formats'])
-                except ValueError:
-                    max_h = 0
-            if max_h:
-                target_h = max_h if cap is None else min(cap, max_h)
-            else:
-                target_h = cap  # couldn't probe — fall back to the cap (None == Best)
-
-            wants_highres_notice = (
-                self.download_type.get() == "video"
-                and self.video_format.get() == "mp4"
-                and self.ffmpeg_available
-                and self.ask_hires_codec
-                and target_h is not None and target_h >= 2160
-            )
-            if wants_highres_notice:
-                self.after(0, lambda h=target_h: self.ask_highres_mkv_notice(url, h))
-                return
-
-            ydl_opts = self._build_ydl_opts(noplaylist=True, target_height=target_h, url=url)
-            self._run_download_and_finish(ydl_opts, url,
-                                          "Download completed! Yummy output folder so stuffed mmm!")
-
+            handed_off = bool(work(job, *args))
         except Exception as e:
-            self._handle_download_error(e, url)
+            if job.cancel.is_set():
+                self._finish_cancelled(job)
+            else:
+                handed_off = self._handle_download_error(e, job.url)
         finally:
-            self.is_downloading = False
-            self.after(0, lambda: self.download_btn.configure(state="normal", text="DOWNLOAD"))
+            if not handed_off:
+                self.after(0, lambda: self._end_download(job))
 
-    def ask_playlist_download(self, url, playlist_title, count):
+    def _finish_cancelled(self, job):
+        """Worker side of Cancel: make sure nothing is left running or half-written."""
+        self._kill_process_tree(job.process)
+        self._remove_partial_files(job)
+        self.after(0, lambda: self.update_status("Download cancelled."))
+        self.after(0, lambda: self.progress_bar.set(0))
+
+    def download_media(self, job):
+        """Worker: pre-scan the URL, then download it or hand off to a dialog."""
+        url = job.url
+        self._await_engine(job)
+        self.after(0, lambda: self.update_status(f"Peeping that URL: {url}", append=False))
+
+        # Pre-scan: detect playlists and (for single videos) the max available
+        # resolution.  extract_flat='in_playlist' keeps playlist scans fast while
+        # still returning full formats for a single video.
+        ydl_opts_check = {
+            'quiet': True,
+            'no_warnings': True,
+            'extract_flat': 'in_playlist',
+        }
+        self._apply_auth_opts(ydl_opts_check, url)
+
+        info = None
+        is_playlist = False
+        prescan_failed = False
+        try:
+            # Prefer the auto-updated engine: extraction is the part that
+            # breaks when a site changes, so probing with the frozen-in
+            # library would reintroduce the staleness we just fixed.
+            if getattr(sys, 'frozen', False) and self._have_ytdlp_exe():
+                info = self._probe_with_exe(ydl_opts_check, url, job)
+            else:
+                with yt_dlp.YoutubeDL(ydl_opts_check) as ydl:
+                    info = ydl.extract_info(url, download=False)
+            is_playlist = bool(info) and 'entries' in info
+        except DownloadCancelledError:
+            raise
+        except Exception as pre_e:
+            self._raise_if_cancelled(job)
+            pre_error_msg = str(pre_e)
+            # If this looks like a sign-in wall, offer the sign-in popup
+            # instead of failing. Capture the text now; Python clears
+            # exception variables before delayed Tk callbacks run.
+            if self._route_auth_failure(url, pre_error_msg):
+                return True
+            # Otherwise (network/other) don't abort — fall back to a single-item
+            # download with the fresh engine, which may still succeed. It's
+            # limited to one item: if this was a channel too big to scan in
+            # time, it must not quietly download all of it.
+            prescan_failed = True
+            self.after(0, lambda: self.update_status(
+                "Couldn't pre-scan the URL; trying as a single download..."))
+        self._raise_if_cancelled(job)
+
+        # Handle playlist - always ask user
+        if is_playlist:
+            playlist_title = info.get('title', 'Unknown Playlist')
+            entry_count = len(list(info.get('entries', [])))
+
+            self.after(0, lambda: self.update_status(
+                f"Playlist detected: '{playlist_title}' ({entry_count} items)"))
+
+            # Ask user in a dialog, which now owns the job
+            self.after(0, lambda: self.ask_playlist_download(job, playlist_title, entry_count))
+            return True
+
+        # Single video: work out the target height so we can warn when a
+        # high-res mp4 request will be saved as mkv to avoid conversion.
+        # target_h is None when we couldn't determine it (Best on a URL we
+        # failed to pre-scan) — treated downstream as high-res.
+        settings = job.settings
+        cap = self._quality_to_height(settings['quality'])
+        max_h = 0
+        if info and info.get('formats'):
+            try:
+                max_h = max((f.get('height') or 0) for f in info['formats'])
+            except ValueError:
+                max_h = 0
+        if max_h:
+            target_h = max_h if cap is None else min(cap, max_h)
+        else:
+            target_h = cap  # couldn't probe — fall back to the cap (None == Best)
+
+        # The MKV notice only applies when there's no GPU to make a real MP4.
+        wants_highres_notice = (
+            settings['download_type'] == "video"
+            and settings['video_format'] == "mp4"
+            and self.ffmpeg_available
+            and self.ask_hires_codec
+            and target_h is not None and target_h >= 2160
+            and not self._gpu_codec_for(target_h)
+        )
+        if wants_highres_notice:
+            self.after(0, lambda h=target_h: self.ask_highres_mkv_notice(job, h))
+            return True
+
+        self._run_download_and_finish(
+            job,
+            lambda gpu: self._build_ydl_opts(settings, noplaylist=True, target_height=target_h,
+                                             url=url, single_item=prescan_failed, prefer_gpu=gpu),
+            "Download completed! Yummy output folder so stuffed mmm!")
+        return False
+
+    def ask_playlist_download(self, job, playlist_title, count):
         result = messagebox.askyesnocancel(
             "Playlist Detected",
             f"'{playlist_title}' contains {count} items.\n\n"
@@ -2892,32 +3462,25 @@ class VideoDownloaderApp(ctk.CTk):
 
         if result is None:  # Cancel
             self.update_status("Download cancelled")
-            self.is_downloading = False
-            self.download_btn.configure(state="normal", text="DOWNLOAD")
             self.progress_bar.set(0)
+            self._end_download(job)
             return
 
-        # Continue download in thread
-        thread = threading.Thread(
-            target=self.download_with_playlist_choice,
-            args=(url, result),
-            daemon=True
-        )
-        thread.start()
+        job.expected = count if result else 1
+        self._start_worker(job, self.download_with_playlist_choice, result)
 
-    def download_with_playlist_choice(self, url, download_all):
-        try:
-            ydl_opts = self._build_ydl_opts(noplaylist=not download_all, url=url)
-            self._run_download_and_finish(ydl_opts, url,
-                                          "You did it you downloaded yay! Check your output folder!")
+    def download_with_playlist_choice(self, job, download_all):
+        """Worker: the whole playlist, or just its first item."""
+        settings = job.settings
+        self._run_download_and_finish(
+            job,
+            lambda gpu: self._build_ydl_opts(settings, noplaylist=not download_all, url=job.url,
+                                             playlist_all=download_all,
+                                             single_item=not download_all, prefer_gpu=gpu),
+            "You did it you downloaded yay! Check your output folder!",
+            playlist_all=download_all)
 
-        except Exception as e:
-            self._handle_download_error(e, url)
-        finally:
-            self.is_downloading = False
-            self.after(0, lambda: self.download_btn.configure(state="normal", text="DOWNLOAD"))
-
-    def ask_highres_mkv_notice(self, url, target_h):
+    def ask_highres_mkv_notice(self, job, target_h):
         """Warn that a high-res mp4 request will be saved as mkv.
 
         Runs on the main thread. On confirm it kicks off the download in a worker
@@ -2943,7 +3506,8 @@ class VideoDownloaderApp(ctk.CTk):
         ctk.CTkLabel(
             content,
             text=f"This is a {res_label} video.\n"
-                 "4K+ videos will be downloaded as .mkv in order to ensure compatibility with video editing software.",
+                 "No GPU encoder was found, so it will be saved as .mkv: converting "
+                 "it to .mp4 on the CPU would take a very long time.",
             font=ctk.CTkFont(size=14, weight="bold"),
             text_color=self.colors['text'], justify="center", wraplength=430,
         ).pack(anchor="center", pady=(0, 18))
@@ -2957,21 +3521,16 @@ class VideoDownloaderApp(ctk.CTk):
 
         def cancel():
             dialog.destroy()
-            self.is_downloading = False
-            self.download_btn.configure(state="normal", text="DOWNLOAD")
             self.progress_bar.set(0)
             self.update_status("Download cancelled")
+            self._end_download(job)
 
         def confirm():
             if remember_var.get():
                 self.ask_hires_codec = False
                 self.save_config()
             dialog.destroy()
-            threading.Thread(
-                target=self._download_single_highres_mkv,
-                args=(url, target_h),
-                daemon=True,
-            ).start()
+            self._start_worker(job, self._download_single_highres_mkv, target_h)
 
         ctk.CTkButton(btn_row, text="Cancel", command=cancel, width=120, height=38,
                       fg_color=self.colors['frame_bg'], hover_color=self.colors['dark_purple']).pack(side="left", padx=(0, 36))
@@ -2981,47 +3540,43 @@ class VideoDownloaderApp(ctk.CTk):
         dialog.protocol("WM_DELETE_WINDOW", cancel)
         dialog.after(120, dialog.grab_set)  # modal once the window exists
 
-    def _download_single_highres_mkv(self, url, target_height=None):
+    def _download_single_highres_mkv(self, job, target_height=None):
         """Worker: download a single high-res video as mkv without transcoding."""
-        try:
-            ydl_opts = self._build_ydl_opts(noplaylist=True, target_height=target_height, url=url)
-            self._run_download_and_finish(ydl_opts, url,
-                                          "Download completed! Yummy output folder so stuffed mmm!")
-        except Exception as e:
-            self._handle_download_error(e, url)
-        finally:
-            self.is_downloading = False
-            self.after(0, lambda: self.download_btn.configure(state="normal", text="DOWNLOAD"))
+        settings = job.settings
+        self._run_download_and_finish(
+            job,
+            lambda gpu: self._build_ydl_opts(settings, noplaylist=True,
+                                             target_height=target_height, url=job.url,
+                                             prefer_gpu=gpu),
+            "Download completed! Yummy output folder so stuffed mmm!")
 
     def start_download(self):
+        # While a job runs this button is Cancel.
+        if self._job is not None:
+            self.cancel_download()
+            return
+
         url = self.url_entry.get().strip()
 
         if not url:
             messagebox.showwarning("No URL", "kinda need a URL to download lol!")
             return
 
-        if self.is_downloading:
-            messagebox.showinfo("Download in Progress", "Please wait for the current download to finish!")
-            return
-
-        output_dir = self.output_folder.get()
-        if not os.path.exists(output_dir):
+        settings = self._snapshot_settings()
+        output_dir = settings['output_folder']
+        if not output_dir or not os.path.isdir(output_dir):
             try:
                 os.makedirs(output_dir)
             except Exception:
                 messagebox.showerror("bruh", "Kinda need a valid output folder to output into a folder...")
                 return
 
-        self.is_downloading = True
-        self.download_btn.configure(state="disabled", text="Downloading...")
-        self.progress_bar.set(0)
         # Fresh attempt: go back to yt-dlp's own default clients. Only the
         # sign-in retry widens them (see _apply_auth_opts).
         self._widen_player_clients = False
-
-        # Start download in separate thread
-        thread = threading.Thread(target=self.download_media, args=(url,), daemon=True)
-        thread.start()
+        job = self._begin_job(url, settings)
+        self.progress_bar.set(0)
+        self._start_worker(job, self.download_media)
 
 
 if __name__ == "__main__":

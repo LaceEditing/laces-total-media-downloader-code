@@ -167,8 +167,9 @@ and icon. Nothing goes outside `$HOME` and it never asks for root.
 - **Deno:** auto-downloaded at runtime for YouTube's JS challenge, and only if
   no `deno`/`node` is already on PATH. Nothing to bundle.
 - **GPU transcoding:** the static ffmpeg supports NVENC/VAAPI, but the startup
-  probe only tests `*_nvenc`/`*_qsv`/`*_amf`. On NVIDIA boxes NVENC may work;
-  otherwise it falls back to CPU (libx264/libx265). VAAPI isn't wired up yet.
+  probe only tests `*_nvenc`/`*_qsv`/`*_amf`. On NVIDIA boxes NVENC may work.
+  Without a working encoder, MOV/FLV conversions use CPU libx264 and 1440p+ MP4
+  requests are saved as MKV instead. VAAPI isn't wired up yet.
 - **Portability:** see section 4 — this is what `packaging/release-linux.sh`
   exists for.
 - **The build machine's font stack is deliberately not bundled.** The spec drops

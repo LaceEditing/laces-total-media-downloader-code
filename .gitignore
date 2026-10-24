@@ -13,6 +13,11 @@ deno
 /ffprobe
 .venv-linux/
 
+# Nothing in the app uses ffplay, and built executables belong in releases,
+# not the repo (both used to be committed, ~100 MB each)
+ffplay.exe
+test/*.exe
+
 # C extensions
 *.so
 
@@ -41,6 +46,8 @@ MANIFEST
 #  before PyInstaller builds the exe, so as to inject date/other infos into it.
 *.manifest
 *.spec
+# ...except the hand-maintained build spec, which is tracked
+!LacesTotalMediaDownloader.spec
 
 # Installer logs
 pip-log.txt

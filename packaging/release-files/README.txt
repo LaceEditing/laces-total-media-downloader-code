@@ -1,4 +1,4 @@
-Lace's Total Media Downloader 3.8.0 — Linux (x86-64)
+Lace's Total Media Downloader 3.9.0 — Linux (x86-64)
 ====================================================
 
 Download video and audio from hundreds of sites.
@@ -10,12 +10,12 @@ no Python, no ffmpeg, no yt-dlp. It is already inside the file.
 RUN IT
 ------
 
-    ./LacesTotalMediaDownloader_v3.8.0_linux
+    ./LacesTotalMediaDownloader_v3.9.0_linux
 
 If your file manager or shell says it isn't executable, the download lost the
 permission bit. Restore it with:
 
-    chmod +x LacesTotalMediaDownloader_v3.8.0_linux
+    chmod +x LacesTotalMediaDownloader_v3.9.0_linux
 
 
 ADD IT TO YOUR APPLICATIONS MENU (optional)

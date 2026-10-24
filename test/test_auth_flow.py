@@ -67,6 +67,9 @@ NETSCAPE_COOKIES = (
 )
 
 
+_ENGINE_DIR = tempfile.mkdtemp(prefix='lace-test-engine-')
+
+
 def make_app():
     """A VideoDownloaderApp with just the attributes the auth helpers need."""
     app = object.__new__(VideoDownloaderApp)
@@ -75,6 +78,11 @@ def make_app():
     # Only the sign-in retry widens YouTube's player_client; a fresh attempt
     # leaves that list to yt-dlp itself.
     app._widen_player_clients = False
+    # Keep results independent of this machine: no real browser profiles (a
+    # PC with Firefox would otherwise get its profile path appended), and no
+    # %LOCALAPPDATA% engine folder created as a side effect.
+    app._browser_profile_dir = lambda browser: None
+    app._engine_dir = lambda: _ENGINE_DIR
     return app
 
 

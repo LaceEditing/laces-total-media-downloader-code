@@ -11,7 +11,15 @@ built on [yt-dlp](https://github.com/yt-dlp/yt-dlp) with a customtkinter UI.
   downloads working without you reinstalling anything.
 - YouTube sign-in by reading cookies live from a browser you're already logged
   into, for age-restricted and members-only videos. No cookies are stored.
-- GPU-accelerated transcoding when a usable encoder is present, CPU otherwise
+- GPU transcoding (NVIDIA NVENC, Intel Quick Sync, AMD AMF), detected
+  automatically: 1440p and up saved as real MP4 instead of MKV, and fast
+  MOV/FLV conversion. Without a usable GPU encoder, high-res MP4 requests are
+  saved as MKV rather than spending ages on a CPU transcode.
+- Cancel any download; closing the window also stops yt-dlp and ffmpeg and
+  removes half-written files
+- Playlists keep going past private or removed videos and report how many saved
+- Everything the app downloads and runs (the yt-dlp engine, Deno, app updates)
+  is checked against its published SHA-256 before use
 - Bundled ffmpeg, so merging and conversion work out of the box
 
 ## Installing
@@ -30,7 +38,7 @@ offers you the build for the platform you're on.
 On Linux, to get it into your application menu with a proper icon:
 
 ```bash
-./install-linux.sh /path/to/LacesTotalMediaDownloader_v3.8.0_linux
+./install-linux.sh /path/to/LacesTotalMediaDownloader_v3.9.0_linux
 ```
 
 ## Where it keeps things
@@ -81,3 +89,18 @@ python main.py
 `ffmpeg` needs to be on your PATH, or sitting next to `main.py`. Without it the
 app still runs but can only fetch single-format files — no merging, no
 conversion to mp3.
+
+Running from source, the app refreshes the `yt-dlp` package in your
+environment on launch and never offers to replace itself; pull the latest code
+to update.
+
+## Tests
+
+```bash
+python test/test_auth_flow.py
+python test/test_download_flow.py
+```
+
+Neither needs a display or network access; they cover sign-in handling, the
+option translation for the external engine, job lifecycle and cancel cleanup,
+GPU transcoding choices, and checksum verification.
